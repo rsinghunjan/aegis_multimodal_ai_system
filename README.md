@@ -25,6 +25,7 @@ Run the main script: `python app.py`
 ## Disclaimer
 
 This is a blueprint and requires significant hardware resources and customization to run effectively.
+
 import torch
 from transformers import (
     pipeline,
