@@ -29,9 +29,6 @@ This is a blueprint and requires significant hardware resources and customizatio
 
 
 
-# --- Model Initialization (Load on demand or at startup) ---
-# Use 4-bit quantization for efficiency
-quantization_config = BitsAndBytesConfig(load_in_4bit=True)
 
 class MultimodalAISystem:
     def __init__(self):
