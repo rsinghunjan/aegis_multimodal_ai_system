@@ -26,26 +26,8 @@ Run the main script: `python app.py`
 
 This is a blueprint and requires significant hardware resources and customization to run effectively.
 
-import torch
-from transformers import (
-    pipeline,
-    AutoProcessor,
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-    AutoTokenizer
-)
-from diffusers import StableDiffusionXLPipeline
-import httpx
-from typing import Dict, Any
-import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# Check for GPU
-device = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"Using device: {device}")
 
 # --- Model Initialization (Load on demand or at startup) ---
 # Use 4-bit quantization for efficiency
