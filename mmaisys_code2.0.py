@@ -2212,5 +2212,400 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
+# distributed_orchestrator.py
+from redis import Redis
+from rq import Queue, Worker
+from rq.job import Job
+from rq.registry import StartedJobRegistry
+import httpx
+import json
+import logging
+from typing import Dict, Any
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Connect to Redis
+redis_conn = Redis(host='redis-ha-service', port=6379, decode_responses=True)
+task_queue = Queue('aegis_tasks', connection=redis_conn, default_timeout=3600)
+
+class DistributedOrchestrator:
+    def __init__(self):
+        self.http_client = httpx.AsyncClient()
+        self.registry = StartedJobRegistry('aegis_tasks', connection=redis_conn)
+
+    async def submit_task(self, task_type: str, payload: Dict[str, Any]) -> str:
+        """Submit a task to the distributed queue and return job ID."""
+        job = task_queue.enqueue(
+            f'worker_functions.{task_type}_handler',
+            payload,
+            job_timeout=300,
+            result_ttl=86400  # Keep results for 24 hours
+        )
+        logger.info(f"Submitted task {task_type} as job {job.id}")
+        return job.id
+
+    async def get_task_status(self, job_id: str) -> Dict[str, Any]:
+        """Check the status of a distributed task."""
+        try:
+            job = Job.fetch(job_id, connection=redis_conn)
+            return {
+                'status': job.get_status(),
+                'result': job.result,
+                'error': job.exc_info,
+                'created_at': job.created_at,
+                'started_at': job.started_at,
+                'ended_at': job.ended_at
+            }
+        except Exception as e:
+            return {'status': 'failed', 'error': str(e)}
+
+    async def get_system_health(self) -> Dict[str, Any]:
+        """Get health metrics for the distributed system."""
+        return {
+            'queue_length': task_queue.count,
+            'active_workers': len(self.registry),
+            'failed_jobs': task_queue.failed_job_registry.count,
+            'scheduled_jobs': task_queue.scheduled_job_registry.count
+        }
+
+# Worker functions (would be in a separate worker process)
+def vision_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Process vision tasks in a dedicated worker."""
+    from vision_processor import process_image
+    try:
+        result = process_image(payload['image_url'], payload['prompt'])
+        return {'success': True, 'data': result}
+    except Exception as e:
+        logger.error(f"Vision processing failed: {e}")
+        return {'success': False, 'error': str(e)}
+
+def llm_handler(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Process LLM tasks in a dedicated worker."""
+    from llm_processor import generate_text
+    try:
+        result = generate_text(payload['prompt'], payload.get('model', 'default'))
+        return {'success': True, 'data': result}
+    except Exception as e:
+        logger.error(f"LLM processing failed: {e}")
+        return {'success': False, 'error': str(e)}
+
+# model_cache.py
+import threading
+import time
+from typing import Dict, Any, Optional
+from dataclasses import dataclass
+from functools import lru_cache
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ModelInfo:
+    model: Any  # The actual model object
+    size_gb: float
+    last_used: float
+    load_count: int
+
+class PredictiveModelCache:
+    def __init__(self, max_memory_gb: float = 40):
+        self.max_memory_gb = max_memory_gb
+        self.used_memory_gb = 0.0
+        self.models: Dict[str, ModelInfo] = {}
+        self.lock = threading.RLock()
+        self._access_pattern = {}  # Track access patterns for prediction
+
+    def _make_room(self, required_gb: float):
+        """Evict least recently used models until there's enough space."""
+        with self.lock:
+            # Sort models by last_used (oldest first)
+            lru_models = sorted(self.models.items(), key=lambda x: x[1].last_used)
+            
+            for model_id, model_info in lru_models:
+                if self.used_memory_gb - model_info.size_gb >= required_gb:
+                    self._unload_model(model_id)
+                else:
+                    break
+
+    def _unload_model(self, model_id: str):
+        """Safely unload a model from memory."""
+        model_info = self.models[model_id]
+        try:
+            # Clear model from GPU memory
+            if hasattr(model_info.model, 'to'):
+                model_info.model.to('cpu')
+            if hasattr(model_info.model, 'cpu'):
+                model_info.model.cpu()
+            # Additional cleanup for specific frameworks
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            logger.error(f"Error unloading model {model_id}: {e}")
+        finally:
+            self.used_memory_gb -= model_info.size_gb
+            del self.models[model_id]
+            logger.info(f"Unloaded model {model_id}. Memory freed: {model_info.size_gb}GB")
+
+    def get_model(self, model_id: str, model_loader: callable, size_gb: float) -> Any:
+        """Get a model, loading it if necessary with predictive pre-loading."""
+        with self.lock:
+            # Check if model is already loaded
+            if model_id in self.models:
+                self.models[model_id].last_used = time.time()
+                self.models[model_id].load_count += 1
+                return self.models[model_id].model
+
+            # Make room if needed
+            if self.used_memory_gb + size_gb > self.max_memory_gb:
+                self._make_room(size_gb)
+
+            # Load the model
+            logger.info(f"Loading model {model_id} ({size_gb}GB)")
+            model = model_loader()
+            self.models[model_id] = ModelInfo(
+                model=model,
+                size_gb=size_gb,
+                last_used=time.time(),
+                load_count=1
+            )
+            self.used_memory_gb += size_gb
+            
+            return model
+
+    def preload_models(self, model_ids: list):
+        """Preload models based on predicted usage patterns."""
+        # Simple prediction: preload during off-peak hours
+        current_hour = time.localtime().tm_hour
+        if 1 <= current_hour <= 5:  # 1 AM to 5 AM
+            for model_id in model_ids:
+                if model_id not in self.models:
+                    try:
+                        self.get_model(model_id, self._get_loader(model_id), self._get_size(model_id))
+                    except Exception as e:
+                        logger.warning(f"Failed to preload {model_id}: {e}")
+
+    def cleanup_idle_models(self, idle_time_seconds: int = 3600):
+        """Clean up models that haven't been used for a while."""
+        with self.lock:
+            current_time = time.time()
+            models_to_remove = []
+            
+            for model_id, model_info in self.models.items():
+                if current_time - model_info.last_used > idle_time_seconds:
+                    models_to_remove.append(model_id)
+            
+            for model_id in models_to_remove:
+                self._unload_model(model_id)
+
+# observability.py
+from prometheus_client import Counter, Gauge, Histogram, generate_latest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+import logging
+from typing import Dict, Any
+import time
+
+# Initialize tracing
+trace.set_tracer_provider(TracerProvider())
+trace.get_tracer_provider().add_span_processor(
+    BatchSpanProcessor(OTLPSpanExporter())
+)
+tracer = trace.get_tracer("aegis.orchestrator")
+
+# Instrument HTTP clients
+HTTPXClientInstrumentor().instrument()
+
+# Prometheus metrics
+REQUEST_COUNT = Counter('aegis_requests_total', 'Total requests', ['model', 'status_code'])
+REQUEST_LATENCY = Histogram('aegis_request_latency_seconds', 'Request latency', ['model'])
+ACTIVE_REQUESTS = Gauge('aegis_active_requests', 'Active requests')
+MODEL_LOAD_TIME = Histogram('aegis_model_load_seconds', 'Model load time', ['model'])
+GPU_MEMORY_USAGE = Gauge('aegis_gpu_memory_bytes', 'GPU memory usage')
+
+class ObservabilityMiddleware:
+    def __init__(self, app_name: str = "aegis"):
+        self.app_name = app_name
+        
+    async def track_request(self, model: str, func: callable, *args, **kwargs):
+        """Track a request with full observability."""
+        with tracer.start_as_current_span(f"{model}_processing") as span:
+            span.set_attribute("model", model)
+            span.set_attribute("args", str(args))
+            
+            ACTIVE_REQUESTS.inc()
+            start_time = time.time()
+            
+            try:
+                result = await func(*args, **kwargs)
+                latency = time.time() - start_time
+                
+                # Record success
+                REQUEST_COUNT.labels(model=model, status_code="200").inc()
+                REQUEST_LATENCY.labels(model=model).observe(latency)
+                span.set_status(trace.Status(trace.StatusCode.OK))
+                span.set_attribute("latency", latency)
+                
+                return result
+                
+            except Exception as e:
+                # Record failure
+                latency = time.time() - start_time
+                REQUEST_COUNT.labels(model=model, status_code="500").inc()
+                REQUEST_LATENCY.labels(model=model).observe(latency)
+                span.record_exception(e)
+                span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+                raise
+            finally:
+                ACTIVE_REQUESTS.dec()
+
+    def track_model_load(self, model: str, load_func: callable):
+        """Track model loading performance."""
+        start_time = time.time()
+        try:
+            result = load_func()
+            load_time = time.time() - start_time
+            MODEL_LOAD_TIME.labels(model=model).observe(load_time)
+            return result
+        except Exception as e:
+            logger.error(f"Model load failed for {model}: {e}")
+            raise
+
+# Structured logging configuration
+def setup_structured_logging():
+    import json
+    from pythonjsonlogger import jsonlogger
+
+    class StructuredLogger(logging.Logger):
+        def _log(self, level, msg, args, exc_info=None, extra=None, stack_info=False):
+            if extra is None:
+                extra = {}
+            
+            # Add standard fields
+            extra.update({
+                'timestamp': time.time(),
+                'level': logging.getLevelName(level),
+                'service': 'aegis',
+                'message': msg,
+            })
+            
+            super()._log(level, json.dumps(extra), (), exc_info, stack_info)
+
+    logging.setLoggerClass(StructuredLogger)
+    
+    handler = logging.StreamHandler()
+    formatter = jsonlogger.JsonFormatter(
+        '%(timestamp)s %(level)s %(service)s %(message)s'
+    )
+    handler.setFormatter(formatter)
+    
+    logger = logging.getLogger()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    
+    return logger
+
+# content_addressable_storage.py
+import hashlib
+from pathlib import Path
+from typing import Optional, BinaryIO
+import aiofiles
+from redis import Redis
+import json
+from minio import Minio
+from minio.error import S3Error
+
+class ContentAddressableStorage:
+    def __init__(self, minio_client: Minio, redis_client: Redis, bucket_name: str = "aegis-data"):
+        self.minio = minio_client
+        self.redis = redis_client
+        self.bucket_name = bucket_name
+        self._ensure_bucket()
+
+    def _ensure_bucket(self):
+        """Ensure the bucket exists."""
+        try:
+            if not self.minio.bucket_exists(self.bucket_name):
+                self.minio.make_bucket(self.bucket_name)
+        except S3Error as e:
+            logger.error(f"Failed to ensure bucket exists: {e}")
+            raise
+
+    def _get_content_hash(self, data: bytes) -> str:
+        """Generate a SHA-256 hash of the content."""
+        return hashlib.sha256(data).hexdigest()
+
+    async def store_data(self, data: bytes, content_type: str = "application/octet-stream") -> str:
+        """Store data and return its content address."""
+        content_hash = self._get_content_hash(data)
+        
+        # Check if already exists
+        if self.redis.exists(f"cas:{content_hash}"):
+            return content_hash
+
+        # Store in object storage
+        try:
+            self.minio.put_object(
+                self.bucket_name,
+                content_hash,
+                data,
+                len(data),
+                content_type=content_type
+            )
+            
+            # Store metadata in Redis for fast lookup
+            metadata = {
+                'content_type': content_type,
+                'size': len(data),
+                'bucket': self.bucket_name,
+                'stored_at': time.time()
+            }
+            self.redis.setex(f"cas:{content_hash}", 86400, json.dumps(metadata))  # 24h cache
+            
+            return content_hash
+            
+        except S3Error as e:
+            logger.error(f"Failed to store data in CAS: {e}")
+            raise
+
+    async def retrieve_data(self, content_hash: str) -> Optional[bytes]:
+        """Retrieve data by its content hash."""
+        # Check Redis cache first
+        cached_data = self.redis.get(f"cas_data:{content_hash}")
+        if cached_data:
+            return cached_data
+
+        # Retrieve from object storage
+        try:
+            response = self.minio.get_object(self.bucket_name, content_hash)
+            data = response.read()
+            
+            # Cache in Redis (for small files)
+            if len(data) < 1024 * 1024:  # 1MB max for Redis
+                self.redis.setex(f"cas_data:{content_hash}", 3600, data)  # 1h cache
+                
+            return data
+            
+        except S3Error as e:
+            logger.error(f"Failed to retrieve data from CAS: {e}")
+            return None
+
+    async def get_presigned_url(self, content_hash: str, expires_seconds: int = 3600) -> Optional[str]:
+        """Generate a presigned URL for direct access."""
+        try:
+            return self.minio.presigned_get_object(
+                self.bucket_name,
+                content_hash,
+                expires=expires_seconds
+            )
+        except S3Error as e:
+            logger.error(f"Failed to generate presigned URL: {e}")
+            return None
+
 
     
