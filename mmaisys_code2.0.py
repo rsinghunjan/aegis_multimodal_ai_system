@@ -636,4 +636,122 @@ class AzureStorageClient(StorageClient):
 if __name__ == "__main__":
     import uvicorn
 
+# orchestrator_async.py
+import uuid
+from redis import Redis
+from celery import Celery
+
+# Connect to message broker (Redis)
+redis_client = Redis(host='redis-host', port=6379)
+app = Celery('aegis_tasks', broker='redis://redis-host:6379/0')
+
+@app.task
+def process_safety_check(message_id: str, user_input: str):
+    # ... safety logic here ...
+    result = safety_model.check(user_input)
+    redis_client.hset(f"result:{message_id}", "safety", result)
+    return result
+
+@app.task
+def process_vision_model(message_id: str, image_url: str):
+    # ... vision logic here ...
+    result = vision_model.analyze(image_url)
+    redis_client.hset(f"result:{message_id}", "vision", result)
+    return result
+
+@app.task
+def process_llm(message_id: str, user_input: str, context: dict):
+    # ... LLM logic here ...
+    result = llm.generate(user_input, context)
+    redis_client.hset(f"result:{message_id}", "llm", result)
+    return result
+
+# FastAPI Endpoint
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+
+app_fastapi = FastAPI()
+
+class AnalysisRequest(BaseModel):
+    user_input: str
+    image_url: str | None = None
+
+@app_fastapi.post("/analyze")
+async def create_analysis(request: AnalysisRequest, background_tasks: BackgroundTasks):
+    message_id = str(uuid.uuid4())
+    
+    # Store initial request
+    redis_client.hset(f"request:{message_id}", mapping=request.dict())
+    
+    # Kick off async tasks
+    background_tasks.add_task(process_safety_check, message_id, request.user_input)
+    if request.image_url:
+        background_tasks.add_task(process_vision_model, message_id, request.image_url)
+    background_tasks.add_task(process_llm, message_id, request.user_input, {})
+    
+    return {"message_id": message_id, "status": "processing"}
+
+@app_fastapi.get("/results/{message_id}")
+async def get_results(message_id: str):
+    results = redis_client.hgetall(f"result:{message_id}")
+    if not results:
+        return {"status": "processing"}
+    return {"status": "complete", "results": results}
+
+# circuit_breaker.py
+from redis import Redis
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import requests
+from requests.exceptions import Timeout, ConnectionError
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, reset_timeout=60):
+        self.redis = Redis(host='redis-host', port=6379)
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+
+    def is_open(self, model_name: str) -> bool:
+        failures = self.redis.get(f"cb_failures:{model_name}") or 0
+        return int(failures) >= self.failure_threshold
+
+    def record_failure(self, model_name: str):
+        key = f"cb_failures:{model_name}"
+        self.redis.incr(key)
+        self.redis.expire(key, self.reset_timeout)
+
+    def record_success(self, model_name: str):
+        self.redis.delete(f"cb_failures:{model_name}")
+
+# Decorator with retry and circuit breaker logic
+def with_circuit_breaker(model_name):
+    def decorator(func):
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=4, max=10),
+            retry=retry_if_exception_type((Timeout, ConnectionError))
+        )
+        def wrapper(*args, **kwargs):
+            cb = CircuitBreaker()
+            if cb.is_open(model_name):
+                raise Exception(f"Circuit breaker for {model_name} is OPEN. Skipping call.")
+            try:
+                result = func(*args, **kwargs)
+                cb.record_success(model_name)
+                return result
+            except (Timeout, ConnectionError) as e:
+                cb.record_failure(model_name)
+                raise e
+        return wrapper
+    return decorator
+
+# Usage in a model task
+@with_circuit_breaker("safety_model")
+def call_safety_model(text: str):
+    response = requests.post(
+        "http://safety-model:8000/predict",
+        json={"text": text},
+        timeout=5.0  # Critical: Set a strict timeout
+    )
+    response.raise_for_status()
+    return response.json()
 
