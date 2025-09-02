@@ -2607,5 +2607,198 @@ class ContentAddressableStorage:
             logger.error(f"Failed to generate presigned URL: {e}")
             return None
 
+# zero_trust_security.py
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime, timedelta
+import jwt
+from passlib.context import CryptContext
+from fastapi import HTTPException, Depends, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+class User(BaseModel):
+    id: str
+    username: str
+    hashed_password: str
+    roles: List[str] = ["user"]
+    is_active: bool = True
+    rate_limit: int = 1000  # Requests per day
+
+class ZeroTrustSecurity:
+    def __init__(self, secret_key: str, algorithm: str = "HS256"):
+        self.secret_key = secret_key
+        self.algorithm = algorithm
+        self.token_blacklist = set()  # In production, use Redis
+
+    def verify_password(self, plain_password, hashed_password):
+        return pwd_context.verify(plain_password, hashed_password)
+
+    def get_password_hash(self, password):
+        return pwd_context.hash(password)
+
+    def create_access_token(self, user: User, expires_delta: Optional[timedelta] = None):
+        to_encode = {"sub": user.id, "roles": user.roles}
+        expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+        to_encode.update({"exp": expire})
+        return jwt.encode(to_encode, self.secret_key, algorithm=self.algorithm)
+
+    def verify_token(self, token: str) -> dict:
+        try:
+            if token in self.token_blacklist:
+                raise HTTPException(status_code=401, detail="Token revoked")
+            payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
+            return payload
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Token expired")
+        except jwt.JWTError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+    def rate_limit_check(self, user_id: str, redis_conn):
+        """Check if the user has exceeded their rate limit."""
+        key = f"rate_limit:{user_id}:{datetime.utcnow().strftime('%Y%m%d')}"
+        current_count = redis_conn.incr(key)
+        if current_count == 1:
+            redis_conn.expire(key, 86400)  # Expire at end of day
+        user_limit = self.get_user_limit(user_id)  # Fetch from DB
+        if current_count > user_limit:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+# FastAPI Dependency
+security = HTTPBearer()
+zt_security = ZeroTrustSecurity(secret_key="your-secret-key")  # Use env var in production
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    payload = zt_security.verify_token(token)
+    user = get_user_from_db(payload["sub"])  # Implement this
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User inactive or not found")
+    return user
+
+async def require_role(role: str, user: User = Depends(get_current_user)):
+    if role not in user.roles:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return user
+
+# Usage in endpoint
+@app.get("/admin/dashboard")
+async def admin_dashboard(user: User = Depends(require_role("admin"))):
+    return {"message": "Welcome admin"}
+
+# cost_tracker.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List
+import asyncio
+from redis import Redis
+
+@dataclass
+class CostMetric:
+    timestamp: datetime
+    model: str
+    operation: str  # 'inference', 'training', 'storage'
+    input_tokens: int = 0
+    output_tokens: int = 0
+    image_count: int = 0
+    duration_seconds: float = 0
+    estimated_cost: float = 0
+
+class CostCalculator(ABC):
+    @abstractmethod
+    def calculate_cost(self, metric: CostMetric) -> float:
+        pass
+
+class ModelInferenceCalculator(CostCalculator):
+    def __init__(self, cost_per_1k_input: float, cost_per_1k_output: float):
+        self.cost_per_1k_input = cost_per_1k_input
+        self.cost_per_1k_output = cost_per_1k_output
+
+    def calculate_cost(self, metric: CostMetric) -> float:
+        input_cost = (metric.input_tokens / 1000) * self.cost_per_1k_input
+        output_cost = (metric.output_tokens / 1000) * self.cost_per_1k_output
+        return input_cost + output_cost
+
+class CostTracker:
+    def __init__(self, redis_conn: Redis):
+        self.redis = redis_conn
+        self.calculators = {
+            'llama3-70b': ModelInferenceCalculator(0.80, 0.90),  # $ per 1M tokens
+            'claude-3-opus': ModelInferenceCalculator(15.00, 75.00),
+            'sd-xl': ModelInferenceCalculator(0.0, 0.0)  # Cost per image
+        }
+
+    async def track_operation(self, metric: CostMetric):
+        """Track an operation and its cost."""
+        calculator = self.calculators.get(metric.model)
+        if calculator:
+            metric.estimated_cost = calculator.calculate_cost(metric)
+        
+        # Store in Redis for real-time dashboards
+        date_str = metric.timestamp.strftime('%Y%m%d')
+        pipeline = self.redis.pipeline()
+        
+        # Increment daily total
+        pipeline.incrbyfloat(f"cost:daily:{date_str}", metric.estimated_cost)
+        # Increment user total
+        pipeline.incrbyfloat(f"cost:user:{metric.user_id}:{date_str}", metric.estimated_cost)
+        # Increment model total
+        pipeline.incrbyfloat(f"cost:model:{metric.model}:{date_str}", metric.estimated_cost)
+        
+        await pipeline.execute()
+
+    async def get_daily_report(self, date: datetime) -> Dict:
+        """Generate a cost report for a given day."""
+        date_str = date.strftime('%Y%m%d')
+        keys = [
+            f"cost:daily:{date_str}",
+            f"cost:model:llama3-70b:{date_str}",
+            f"cost:model:claude-3-opus:{date_str}"
+        ]
+        
+        costs = await self.redis.mget(keys)
+        return {
+            "total_cost": float(costs[0] or 0),
+            "by_model": {
+                "llama3-70b": float(costs[1] or 0),
+                "claude-3-opus": float(costs[2] or 0)
+            }
+        }
+
+    async def enforce_budget(self, user_id: str, project_id: str):
+        """Check if a user/project has exceeded their budget."""
+        monthly_budget = await self.redis.get(f"budget:user:{user_id}:monthly")
+        if not monthly_budget:
+            return True
+            
+        current_spend = await self.redis.get(f"cost:user:{user_id}:monthly")
+        if current_spend and float(current_spend) > float(monthly_budget):
+            raise HTTPException(status_code=429, detail="Monthly budget exceeded")
+        
+        return True
+
+# Usage: Wrap model calls
+@zt_security.track_operation
+async def call_model_with_tracking(model_url, prompt, user_id):
+    start_time = datetime.now()
+    response = await call_model(model_url, prompt)
+    end_time = datetime.now()
+    
+    metric = CostMetric(
+        timestamp=datetime.now(),
+        model="llama3-70b",
+        user_id=user_id,
+        operation="inference",
+        input_tokens=len(prompt.split()),
+        output_tokens=len(response.split()),
+        duration_seconds=(end_time - start_time).total_seconds()
+    )
+    
+    await cost_tracker.track_operation(metric)
+    return response
+
 
     
