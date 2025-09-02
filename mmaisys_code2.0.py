@@ -250,34 +250,34 @@ class MultimodalAISystem:
 ...                 unsafe_score = probs[0][1].item()\
 ...                 return unsafe_score > threshold\
 ...             else: # Fallback to pipeline\
-...                 result = self.classifier(text)[0]\
-...                 # Check if the harmful label is above threshold\
-...                 if result['label'] == 'harmful' and result['score'] > threshold:\
-...                     return True\
-                return False\
-\
-        except Exception as e:\
-            logger.error(f"Safety classification error: \{e\}. Blocking due to error.")\
-            return True  # Block on error to be safe\
-\
-# Global instance\
-safety_checker = SafetyChecker()\
-\
-# app.py\
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks\
-from fastapi.middleware.cors import CORSMiddleware\
-from pydantic import BaseModel\
-import httpx\
-from typing import Optional, List\
-import logging\
-import uuid\
-import time\
-
-# Import our modules
+...                 result = self.classifier(text)[0]
+...                 # Check if the harmful label is above threshold
+...                 if result['label'] == 'harmful' and result['score'] > threshold:
+...                     return True
+...                return False
+...
+...       except Exception as e:
+...         logger.error(f"Safety classification error: \{e\}. Blocking due to error.")
+...           return True  # Block on error to be safe
+...
+... # Global instance
+... safety_checker = SafetyChecker()
+...
+... # app.py
+... from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+... from fastapi.middleware.cors import CORSMiddleware
+... from pydantic import BaseModel
+... import httpx
+... from typing import Optional, List
+... import logging
+... import uuid
+... import time
+...
+... # Import our modules
 from safety_checker import safety_checker
 # ... (Import the MultimodalAISystem class from our previous work, now refactored)
 
-# Initialize app and our AI system\
+# Initialize app and our AI system
 app = FastAPI(title="Multimodal AI API", version="1.0.0")
 ai_system = MultimodalAISystem()
 
