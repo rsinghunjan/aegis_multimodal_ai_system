@@ -3509,5 +3509,261 @@ class AegisExplainer:
         plt.tight_layout()
         return fig
 
+# aegis/data/dataloader.py
+from torch.utils.data import Dataset, DataLoader
+from typing import Dict, List, Callable
+import torch
 
+class MultimodalDataset(Dataset):
+    def __init__(self, data_paths: Dict[str, List[str]], 
+                 transforms: Dict[str, Callable] = None,
+                 task_labels: Dict[str, List] = None):
+        self.data_paths = data_paths
+        self.transforms = transforms or {}
+        self.task_labels = task_labels or {}
+        self.length = len(next(iter(data_paths.values())))
     
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, idx):
+        sample = {'inputs': {}, 'labels': {}}
+        
+        # Load each modality
+        for modality, paths in self.data_paths.items():
+            if idx < len(paths):
+                sample['inputs'][modality] = self._load_modality(modality, paths[idx])
+        
+        # Load labels for each task
+        for task, labels in self.task_labels.items():
+            if idx < len(labels):
+                sample['labels'][task] = labels[idx]
+        
+        return sample
+    
+    def _load_modality(self, modality, path):
+        # Implement modality-specific loading
+        if modality == 'image':
+            return self._load_image(path)
+        elif modality == 'text':
+            return self._load_text(path)
+        elif modality == 'audio':
+            return self._load_audio(path)
+        return None
+
+class DataProcessor:
+    def __init__(self, config):
+        self.config = config
+        self.transforms = self._create_transforms()
+    
+    def create_dataloaders(self):
+        train_loader = DataLoader(
+            self._create_dataset('train'),
+            batch_size=self.config['training']['batch_size'],
+            shuffle=True
+        )
+        # Add validation and test loaders
+        return train_loader
+    
+# aegis/export/exporter.py
+import torch
+import onnx
+import onnxruntime as ort
+from pathlib import Path
+
+class ModelExporter:
+    def __init__(self, model, config):
+        self.model = model
+        self.config = config
+    
+    def export_onnx(self, dummy_input, export_path):
+        """Export model to ONNX format"""
+        torch.onnx.export(
+            self.model,
+            dummy_input,
+            export_path,
+            export_params=True,
+            opset_version=13,
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+        )
+    
+    def export_torchscript(self, dummy_input, export_path):
+        """Export model to TorchScript"""
+        scripted_model = torch.jit.trace(self.model, dummy_input)
+        scripted_model.save(export_path)
+    
+    def create_deployment_package(self, model_path, output_dir):
+        """Create complete deployment package"""
+        # Include model, config, example inputs, and deployment scripts
+        pass
+
+# aegis/utils/monitoring.py
+import wandb
+import numpy as np
+from datetime import datetime
+import torch
+
+class TrainingMonitor:
+    def __init__(self, config):
+        self.config = config
+        self.metrics_history = {
+            'train_loss': [], 'val_loss': [],
+            'learning_rates': [], 'grad_norms': []
+        }
+    
+    def log_metrics(self, metrics, step):
+        """Log metrics to wandb and internal storage"""
+        if wandb.run is not None:
+            wandb.log(metrics, step=step)
+        
+        for key, value in metrics.items():
+            if key in self.metrics_history:
+                self.metrics_history[key].append((step, value))
+    
+    def log_gradients(self, model, step):
+        """Log gradient statistics"""
+        total_norm = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        
+        self.log_metrics({'grad_norm': total_norm}, step)
+    
+    def create_report(self):
+        """Generate training report"""
+        return {
+            'training_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'final_metrics': {k: v[-1][1] for k, v in self.metrics_history.items() if v},
+            'config': self.config
+        }
+
+# aegis/evaluation/evaluator.py
+import torch
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+import numpy as np
+
+class MultimodalEvaluator:
+    def __init__(self, model, dataloader, device):
+        self.model = model
+        self.dataloader = dataloader
+        self.device = device
+    
+    def evaluate(self, tasks=None):
+        """Comprehensive model evaluation"""
+        self.model.eval()
+        results = {}
+        
+        with torch.no_grad():
+            for batch in self.dataloader:
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                outputs, _ = self.model(batch['inputs'], tasks=tasks)
+                
+                for task, output in outputs.items():
+                    if task not in results:
+                        results[task] = {'preds': [], 'targets': []}
+                    
+                    preds = torch.argmax(output, dim=1)
+                    results[task]['preds'].extend(preds.cpu().numpy())
+                    results[task]['targets'].extend(batch['labels'][task].cpu().numpy())
+        
+        # Calculate metrics for each task
+        metrics = {}
+        for task, data in results.items():
+            metrics[task] = self._calculate_metrics(data['preds'], data['targets'])
+        
+        return metrics
+    
+    def _calculate_metrics(self, preds, targets):
+        return {
+            'accuracy': accuracy_score(targets, preds),
+            'f1_score': f1_score(targets, preds, average='weighted'),
+            'confusion_matrix': confusion_matrix(targets, preds)
+        }
+
+# aegis/optimization/hyperparam_tuner.py
+import optuna
+from functools import partial
+
+class HyperparameterTuner:
+    def __init__(self, config, train_func):
+        self.config = config
+        self.train_func = train_func
+    
+    def objective(self, trial):
+        # Suggest hyperparameters
+        lr = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)
+        batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+        dropout = trial.suggest_float('dropout', 0.1, 0.5)
+        
+        # Update config
+        tuned_config = self.config.copy()
+        tuned_config['training']['learning_rate'] = lr
+        tuned_config['training']['batch_size'] = batch_size
+        tuned_config['model']['dropout'] = dropout
+        
+        # Train with these parameters
+        final_metrics = self.train_func(tuned_config)
+        
+        return final_metrics['val_accuracy']  # Maximize validation accuracy
+    
+    def run_study(self, n_trials=50):
+        study = optuna.create_study(direction='maximize')
+        study.optimize(partial(self.objective), n_trials=n_trials)
+        
+        return study.best_params, study.best_value
+
+# aegis/security/adversarial.py
+import torch
+import torch.nn as nn
+
+class AdversarialRobustness:
+    def __init__(self, model, epsilon=0.1):
+        self.model = model
+        self.epsilon = epsilon
+    
+    def fgsm_attack(self, inputs, targets, task):
+        """Fast Gradient Sign Method attack"""
+        inputs.requires_grad = True
+        
+        outputs, _ = self.model({'inputs': inputs}, tasks=[task])
+        loss = nn.CrossEntropyLoss()(outputs[task], targets)
+        loss.backward()
+        
+        # Create adversarial example
+        perturbation = self.epsilon * inputs.grad.sign()
+        adversarial_inputs = inputs + perturbation
+        
+        return adversarial_inputs.detach()
+    
+    def evaluate_robustness(self, dataloader, task):
+        """Evaluate model robustness to adversarial attacks"""
+        clean_accuracy = 0
+        adversarial_accuracy = 0
+        
+        for batch in dataloader:
+            # Clean evaluation
+            outputs, _ = self.model(batch['inputs'], tasks=[task])
+            clean_accuracy += (outputs[task].argmax(1) == batch['labels'][task]).float().mean()
+            
+            # Adversarial evaluation
+            adversarial_inputs = self.fgsm_attack(
+                batch['inputs']['image'], batch['labels'][task], task
+            )
+            adv_outputs, _ = self.model({'image': adversarial_inputs}, tasks=[task])
+            adversarial_accuracy += (adv_outputs[task].argmax(1) == batch['labels'][task]).float().mean()
+        
+        return {
+            'clean_accuracy': clean_accuracy / len(dataloader),
+            'adversarial_accuracy': adversarial_accuracy / len(dataloader),
+            'robustness_gap': (clean_accuracy - adversarial_accuracy) / len(dataloader)
+        }
+
+
+
