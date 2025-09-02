@@ -3125,5 +3125,389 @@ def setup_metrics(app):
 
 # Usage: settings = get_settings()
 
+# aegis/models/registry.py
+_MODEL_REGISTRY = {}
+
+def register_model(model_name, modality):
+    def decorator(model_class):
+        _MODEL_REGISTRY[f"{modality}_{model_name}"] = model_class
+        return model_class
+    return decorator
+
+def get_encoder(model_name, modality, **kwargs):
+    key = f"{modality}_{model_name}"
+    if key not in _MODEL_REGISTRY:
+        raise ValueError(f"Model {key} not found in registry. Available: {list(_MODEL_REGISTRY.keys())}")
+    return _MODEL_REGISTRY[key](**kwargs)
+
+def list_available_models(modality=None):
+    if modality:
+        return [k for k in _MODEL_REGISTRY.keys() if k.startswith(f"{modality}_")]
+    return list(_MODEL_REGISTRY.keys())
+
+# aegis/models/image_encoders.py
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from .registry import register_model
+
+class BaseImageEncoder(nn.Module):
+    def __init__(self, feature_dim=512, pretrained=True):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.pretrained = pretrained
+        
+    def get_output_dim(self):
+        return self.feature_dim
+
+@register_model("resnet50", "image")
+class ResNet50Encoder(BaseImageEncoder):
+    def __init__(self, feature_dim=512, pretrained=True):
+        super().__init__(feature_dim, pretrained)
+        self.model = models.resnet50(pretrained=pretrained)
+        # Remove classification head
+        self.model = nn.Sequential(*list(self.model.children())[:-1])
+        # Projection to desired feature dimension
+        self.projection = nn.Linear(2048, feature_dim)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+    def forward(self, x):
+        features = self.model(x)
+        features = self.pool(features).squeeze(-1).squeeze(-1)
+        return self.projection(features)
+
+@register_model("vit_base", "image")
+class ViTEncoder(BaseImageEncoder):
+    def __init__(self, feature_dim=512, pretrained=True):
+        super().__init__(feature_dim, pretrained)
+        self.model = models.vit_b_16(pretrained=pretrained)
+        # Use CLS token for features
+        self.projection = nn.Linear(768, feature_dim)
+        
+    def forward(self, x):
+        features = self.model(x)
+        return self.projection(features[:, 0])  # CLS token
+
+# aegis/models/fusion.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FusionRegistry:
+    _registry = {}
+    
+    @classmethod
+    def register(cls, name):
+        def decorator(fusion_class):
+            cls._registry[name] = fusion_class
+            return fusion_class
+        return decorator
+    
+    @classmethod
+    def get_fusion(cls, name, **kwargs):
+        return cls._registry[name](**kwargs)
+
+@FusionRegistry.register("concat")
+class ConcatFusion(nn.Module):
+    def __init__(self, input_dims, output_dim):
+        super().__init__()
+        total_dim = sum(input_dims.values())
+        self.fc = nn.Linear(total_dim, output_dim)
+        
+    def forward(self, **modality_features):
+        features = [f for f in modality_features.values() if f is not None]
+        fused = torch.cat(features, dim=-1)
+        return self.fc(fused)
+
+@FusionRegistry.register("cross_attention")
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, embed_dim=512, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        
+        # Self-attention layers for each modality
+        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, query_modality, key_modality, value_modality):
+        # Self-attention on query
+        query_attn, _ = self.self_attn(query_modality, query_modality, query_modality)
+        query_attn = self.norm1(query_modality + self.dropout(query_attn))
+        
+        # Cross-attention
+        cross_attn, attn_weights = self.cross_attn(
+            query_attn, key_modality, value_modality
+        )
+        output = self.norm2(query_attn + self.dropout(cross_attn))
+        
+        return output, attn_weights
+
+@FusionRegistry.register("tensor_fusion")
+class TensorFusion(nn.Module):
+    """Tensor Fusion Networks for Multimodal Sentiment Analysis"""
+    def __init__(self, input_dims, output_dim):
+        super().__init__()
+        self.input_dims = input_dims
+        self.output_dim = output_dim
+        
+        # Learnable parameters for fusion
+        self.fusion_weights = nn.Parameter(torch.randn(output_dim, sum(input_dims.values()) + 1))
+        self.fusion_bias = nn.Parameter(torch.randn(output_dim))
+        
+    def forward(self, **modality_features):
+        # Create outer product representation
+        features = [torch.cat([torch.ones(f.size(0), 1).to(f.device), f], dim=1) 
+                   for f in modality_features.values() if f is not None]
+        
+        # Compute outer product
+        fused = features[0]
+        for f in features[1:]:
+            fused = torch.bmm(fused.unsqueeze(2), f.unsqueeze(1))
+            fused = fused.view(fused.size(0), -1)
+            
+        return torch.matmul(fused, self.fusion_weights.t()) + self.fusion_bias
+
+# aegis/models/multimodal_model.py
+import torch
+import torch.nn as nn
+from typing import Dict, Optional, List
+from .registry import get_encoder
+from .fusion import FusionRegistry
+
+class AegisMultimodalModel(nn.Module):
+    def __init__(self, config: Dict):
+        super().__init__()
+        self.config = config
+        self.encoders = nn.ModuleDict()
+        self.modality_dims = {}
+        
+        # Initialize encoders from config
+        for modality, encoder_config in config['encoders'].items():
+            encoder = get_encoder(
+                encoder_config['model_name'],
+                modality,
+                **encoder_config.get('params', {})
+            )
+            self.encoders[modality] = encoder
+            self.modality_dims[modality] = encoder.get_output_dim()
+        
+        # Initialize fusion mechanism
+        fusion_config = config['fusion']
+        self.fusion = FusionRegistry.get_fusion(
+            fusion_config['type'],
+            input_dims=self.modality_dims,
+            output_dim=config.get('output_dim', 512),
+            **fusion_config.get('params', {})
+        )
+        
+        # Task-specific heads
+        self.heads = nn.ModuleDict()
+        for task_name, task_config in config.get('heads', {}).items():
+            self.heads[task_name] = nn.Linear(
+                config.get('output_dim', 512),
+                task_config['num_classes']
+            )
+        
+        # Missing modality embeddings
+        self.missing_embeddings = nn.ParameterDict()
+        for modality in self.modality_dims:
+            self.missing_embeddings[modality] = nn.Parameter(
+                torch.randn(1, self.modality_dims[modality])
+            )
+    
+    def forward(self, inputs: Dict[str, torch.Tensor], 
+                tasks: Optional[List[str]] = None):
+        # Extract features from available modalities
+        features = {}
+        batch_size = next(iter(inputs.values())).size(0) if inputs else 1
+        
+        for modality, encoder in self.encoders.items():
+            if modality in inputs and inputs[modality] is not None:
+                features[modality] = encoder(inputs[modality])
+            else:
+                # Use learned missing modality embedding
+                features[modality] = self.missing_embeddings[modality].expand(
+                    batch_size, -1
+                )
+        
+        # Fuse features
+        fused_features = self.fusion(**features)
+        
+        # Apply task-specific heads
+        outputs = {}
+        tasks = tasks or list(self.heads.keys())
+        
+        for task in tasks:
+            if task in self.heads:
+                outputs[task] = self.heads[task](fused_features)
+        
+        return outputs, features  # Return both predictions and intermediate features
+
+# aegis/training/trainer.py
+import torch
+import torch.nn as nn
+from typing import Dict, List
+import wandb
+import numpy as np
+from tqdm import tqdm
+
+class AegisTrainer:
+    def __init__(self, model, config, train_loader, val_loader=None):
+        self.model = model
+        self.config = config
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Setup optimizer
+        self.optimizer = self._setup_optimizer()
+        self.scheduler = self._setup_scheduler()
+        
+        # Loss functions per task
+        self.loss_fns = {
+            'sentiment': nn.CrossEntropyLoss(),
+            'topic': nn.CrossEntropyLoss(),
+            'emotion': nn.CrossEntropyLoss()
+        }
+        
+        # Mixed precision training
+        self.scaler = torch.cuda.amp.GradScaler()
+        
+        # Move model to device
+        self.model.to(self.device)
+    
+    def _setup_optimizer(self):
+        opt_config = self.config['training']['optimizer']
+        if opt_config['type'] == 'AdamW':
+            return torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.config['training']['learning_rate'],
+                **opt_config.get('params', {})
+            )
+        # Add other optimizers...
+    
+    def _setup_scheduler(self):
+        sched_config = self.config['training'].get('scheduler', {})
+        if sched_config.get('type') == 'cosine':
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=sched_config['params']['max_epochs']
+            )
+        return None
+    
+    def train_epoch(self, epoch):
+        self.model.train()
+        total_loss = 0
+        progress_bar = tqdm(self.train_loader, desc=f'Epoch {epoch}')
+        
+        for batch_idx, batch in enumerate(progress_bar):
+            # Move batch to device
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
+            
+            with torch.cuda.amp.autocast():
+                outputs, _ = self.model(batch['inputs'], tasks=list(self.loss_fns.keys()))
+                
+                # Compute losses for each task
+                losses = {}
+                for task, output in outputs.items():
+                    if task in self.loss_fns and task in batch['labels']:
+                        losses[task] = self.loss_fns[task](output, batch['labels'][task])
+                
+                total_loss = sum(losses.values())
+            
+            # Backward pass with gradient scaling
+            self.scaler.scale(total_loss).backward()
+            
+            # Gradient accumulation
+            if (batch_idx + 1) % self.config['training']['gradient_accumulation_steps'] == 0:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                'loss': total_loss.item(),
+                'lr': self.optimizer.param_groups[0]['lr']
+            })
+            
+            # Log to wandb
+            if wandb.run is not None:
+                wandb.log({
+                    'train_loss': total_loss.item(),
+                    'epoch': epoch,
+                    'batch': batch_idx,
+                    'lr': self.optimizer.param_groups[0]['lr']
+                })
+        
+        if self.scheduler:
+            self.scheduler.step()
+
+# aegis/explain/explainer.py
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from captum.attr import IntegratedGradients, Occlusion
+
+class AegisExplainer:
+    def __init__(self, model):
+        self.model = model
+        self.model.eval()
+    
+    def explain_prediction(self, inputs, target_task, target_class=None):
+        """Explain model prediction using Integrated Gradients"""
+        # Convert model to eval mode
+        self.model.eval()
+        
+        # Ensure inputs require gradients
+        inputs = {k: v.requires_grad_(True) if isinstance(v, torch.Tensor) else v 
+                 for k, v in inputs.items()}
+        
+        # Use Integrated Gradients
+        ig = IntegratedGradients(self.model)
+        
+        attributions = {}
+        for modality, input_tensor in inputs.items():
+            if isinstance(input_tensor, torch.Tensor):
+                # Compute attributions for this modality
+                attr = ig.attribute(
+                    input_tensor.unsqueeze(0),
+                    target=target_class,
+                    additional_forward_args=({'inputs': inputs}, [target_task])
+                )
+                attributions[modality] = attr.detach().cpu().numpy()
+        
+        return attributions
+    
+    def visualize_attributions(self, attributions, input_data, modality):
+        """Visualize attributions for a specific modality"""
+        if modality == 'image':
+            self._visualize_image_attributions(attributions['image'], input_data['image'])
+        elif modality == 'text':
+            self._visualize_text_attributions(attributions['text'], input_data['text'])
+    
+    def _visualize_image_attributions(self, attributions, original_image):
+        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+        
+        # Original image
+        ax[0].imshow(original_image.squeeze().permute(1, 2, 0))
+        ax[0].set_title('Original Image')
+        ax[0].axis('off')
+        
+        # Attributions
+        attr_vis = np.mean(attributions, axis=1)  # Average across channels
+        im = ax[1].imshow(attr_vis.squeeze(), cmap='hot')
+        ax[1].set_title('Feature Importance')
+        ax[1].axis('off')
+        plt.colorbar(im, ax=ax[1])
+        
+        plt.tight_layout()
+        return fig
+
 
     
