@@ -1250,3 +1250,251 @@ async def safe_query_endpoint(user_query: str, context: str = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
 
+# cognitive_memory.py
+from datetime import datetime, timezone
+import json
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from sentence_transformers import SentenceTransformer
+from typing import List, Dict, Any, Optional
+import uuid
+
+class CognitiveMemory:
+    def __init__(self, host="localhost", port=6333):
+        self.client = QdrantClient(host=host, port=port)
+        self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
+        self.collection_name = "aegis_memory"
+        
+        # Ensure the collection exists
+        try:
+            self.client.get_collection(self.collection_name)
+        except Exception:
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+            )
+
+    async def _create_summary(self, conversation: List[Dict]) -> str:
+        """Use the LLM to generate a concise summary of a conversation."""
+        summary_prompt = f"""
+        Summarize the following conversation into 3-4 key factual points or user preferences.
+        Be concise and only include information that would be useful for future context.
+
+        Conversation:
+        {json.dumps(conversation, indent=2)}
+
+        Summary:
+        """
+        # ... (Code to call the LLM with the summary_prompt) ...
+        return "User is a data scientist interested in GPU clusters. They prefer Python over R. They are working on a project about climate data visualization."
+
+    def store_interaction(self, user_id: str, query: str, response: str, session_id: str, metadata: Optional[Dict] = None):
+        """Store an interaction, but more importantly, generate and store a summary if the conversation is ending."""
+        # 1. Store the raw interaction in a DB (e.g., PostgreSQL)
+        # ... (SQL INSERT code) ...
+
+        # 2. This is the key: If the session is ending, generate a summary and store it in the vector memory.
+        if metadata and metadata.get('session_end', False):
+            # Get the last 20 messages from this session
+            recent_convo = self._get_session_messages(session_id, limit=20)
+            summary = await self._create_summary(recent_convo)
+            
+            # Embed and store the summary for long-term recall
+            summary_embedding = self.encoder.encode(summary).tolist()
+            point_id = str(uuid.uuid4())
+            
+            point = PointStruct(
+                id=point_id,
+                vector=summary_embedding,
+                payload={
+                    "user_id": user_id,
+                    "summary": summary,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "type": "long_term_memory"
+                }
+            )
+            self.client.upsert(collection_name=self.collection_name, points=[point])
+
+    def recall_memory(self, user_id: str, current_query: str, limit: int = 3) -> List[str]:
+        """Recall relevant memories for a user based on the current query."""
+        query_embedding = self.encoder.encode(current_query).tolist()
+        
+        search_result = self.client.search(
+            collection_name=self.collection_name,
+            query_vector=query_embedding,
+            query_filter={
+                "must": [{"key": "user_id", "match": {"value": user_id}}]
+            },
+            limit=limit
+        )
+        
+        return [hit.payload['summary'] for hit in search_result]
+
+# In your chat endpoint
+@app.post("/chat/{user_id}")
+async def chat_with_memory(user_id: str, message: str):
+    # Step 1: Recall relevant past context
+    relevant_memories = memory.recall_memory(user_id, message)
+    context = "\n".join(relevant_memories)
+    
+    # Step 2: Generate response using the context
+    enhanced_prompt = f"""
+    Relevant past context about this user:
+    {context}
+    
+    Current message: {message}
+    """
+    response = await generate_response(enhanced_prompt)
+    
+    # Step 3: Store this interaction for the future
+    memory.store_interaction(user_id, message, response, session_id="current-session-id")
+    
+    return {"response": response}
+
+# studio_dashboard.py
+import gradio as gr
+import pandas as pd
+from redis import Redis
+import plotly.express as px
+import json
+
+# Connect to Aegis's monitoring data source
+redis_client = Redis(host='localhost', port=6379, decode_responses=True)
+
+def get_performance_metrics():
+    """Get recent performance metrics from Redis timeseries."""
+    # This would use RedisTimeSeries or a similar module
+    timestamps = [1, 2, 3, 4, 5]  # Would be real data
+    latency = [105, 98, 112, 89, 101]
+    return pd.DataFrame({"Time": timestamps, "Latency (ms)": latency})
+
+def get_recent_errors():
+    """Get recent errors from a Redis stream."""
+    error_stream = redis_client.xrevrange('aegis:errors', count=10)
+    errors = []
+    for error_id, error_data in error_stream:
+        errors.append({
+            "id": error_id,
+            "timestamp": error_data['timestamp'],
+            "message": error_data['error_message']
+        })
+    return pd.DataFrame(errors)
+
+with gr.Blocks(title="Aegis Studio", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🛡️ Aegis Studio Dashboard")
+    
+    with gr.Tab("Performance"):
+        gr.Markdown("## System Performance Metrics")
+        plot = gr.LinePlot(get_performance_metrics(), x="Time", y="Latency (ms)", title="API Latency (ms)")
+        update_btn = gr.Button("Refresh Data")
+        update_btn.click(fn=get_performance_metrics, outputs=plot)
+    
+    with gr.Tab("Model Management"):
+        gr.Markdown("## Manage Active Models")
+        model_dropdown = gr.Dropdown(["llama3-70b", "deepseek-v2", "claude-3"], label="Select Model")
+        model_config = gr.JSON(value={
+            "temperature": 0.7,
+            "max_tokens": 1000,
+            "top_p": 0.9
+        }, label="Model Configuration")
+        save_btn = gr.Button("Apply Configuration")
+        
+    with gr.Tab("Error Logs"):
+        gr.Markdown("## Recent System Errors")
+        error_table = gr.Dataframe(get_recent_errors(), interactive=False)
+        error_btn = gr.Button("Refresh Errors")
+        error_btn.click(fn=get_recent_errors, outputs=error_table)
+
+if __name__ == "__main__":
+    demo.launch(server_port=7860, share=False)
+
+# self_healing.py
+import asyncio
+from datetime import datetime
+from kubernetes import client, config
+import logging
+import subprocess
+
+class SelfHealingMonitor:
+    def __init__(self):
+        config.load_incluster_config()  # Load Kubernetes config if running in a cluster
+        self.v1 = client.CoreV1Api()
+        self.apps_v1 = client.AppsV1Api()
+        self.health_checks = {
+            "model-server": "http://model-server:8000/health",
+            "safety-checker": "http://safety-checker:8001/health",
+            "cache-service": "http://cache-service:6379/ping"
+        }
+        
+    async def check_health(self):
+        """Periodically check the health of all critical services."""
+        while True:
+            for service_name, health_url in self.health_checks.items():
+                try:
+                    # Try to call the health endpoint
+                    result = subprocess.run([
+                        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", 
+                        health_url, "--connect-timeout", "2"
+                    ], capture_output=True, text=True)
+                    
+                    if result.stdout != "200":
+                        logging.warning(f"Health check failed for {service_name}: {result.stdout}")
+                        await self.recover_service(service_name)
+                        
+                except Exception as e:
+                    logging.error(f"Failed to check health of {service_name}: {e}")
+                    await self.recover_service(service_name)
+            
+            await asyncio.sleep(30)  # Check every 30 seconds
+
+    async def recover_service(self, service_name: str):
+        """Execute recovery actions for a failed service."""
+        logging.info(f"Attempting to recover {service_name}")
+        
+        recovery_strategies = {
+            "model-server": self.restart_model_server,
+            "safety-checker": self.restart_safety_checker,
+            "cache-service": self.restart_cache_service
+        }
+        
+        strategy = recovery_strategies.get(service_name)
+        if strategy:
+            try:
+                await strategy()
+                logging.info(f"Successfully recovered {service_name}")
+            except Exception as e:
+                logging.error(f"Failed to recover {service_name}: {e}")
+                # Escalate to human via alert
+                self.send_alert(f"CRITICAL: Failed to automatically recover {service_name}: {e}")
+
+    async def restart_model_server(self):
+        """Restart the model server deployment in Kubernetes."""
+        # Scale down
+        self.apps_v1.patch_namespaced_deployment_scale(
+            name="model-server",
+            namespace="aegis",
+            body={"spec": {"replicas": 0}}
+        )
+        # Wait a bit
+        await asyncio.sleep(5)
+        # Scale back up
+        self.apps_v1.patch_namespaced_deployment_scale(
+            name="model-server",
+            namespace="aegis",
+            body={"spec": {"replicas": 2}}
+        )
+
+    def send_alert(self, message: str):
+        """Send an alert to operators (e.g., via Slack, PagerDuty)."""
+        # Implementation for sending alerts would go here
+        print(f"ALERT: {message}")
+
+# Start the monitoring loop
+async def main():
+    monitor = SelfHealingMonitor()
+    await monitor.check_health()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
