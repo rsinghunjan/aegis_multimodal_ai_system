@@ -2800,5 +2800,274 @@ async def call_model_with_tracking(model_url, prompt, user_id):
     await cost_tracker.track_operation(metric)
     return response
 
+# core/orchestrator.py
+from typing import Dict, Any, Optional
+from loguru import logger
+import time
+
+class LeanOrchestrator:
+    """
+    A simplified, focused orchestrator that routes requests without complex logic.
+    """
+    def __init__(self, model_endpoints: Dict[str, str]):
+        self.model_endpoints = model_endpoints
+        self.model_health = {model: True for model in model_endpoints.keys()}
+        
+    async def route(self, prompt: str, modality: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Route a request to the appropriate model based on simple rules.
+        """
+        start_time = time.time()
+        
+        # Determine target model (simple logic - can be extended)
+        target_model = self._select_model(prompt, modality)
+        
+        if not self.model_health.get(target_model, False):
+            raise ServiceUnavailableError(f"Model {target_model} is currently unavailable")
+        
+        try:
+            # Delegate the actual call to a dedicated model client
+            response = await self._call_model(target_model, prompt)
+            latency = time.time() - start_time
+            
+            logger.info(f"Request routed to {target_model}", extra={
+                "model": target_model,
+                "latency": latency,
+                "input_length": len(prompt)
+            })
+            
+            return {
+                "response": response,
+                "model": target_model,
+                "latency": latency
+            }
+            
+        except Exception as e:
+            self.model_health[target_model] = False
+            logger.error(f"Model {target_model} failed: {str(e)}")
+            raise
+
+    def _select_model(self, prompt: str, modality: Optional[str]) -> str:
+        """Simple model selection logic."""
+        if modality == "vision" or "image" in prompt.lower():
+            return "vision-model"
+        elif "code" in prompt.lower() or "program" in prompt.lower():
+            return "code-model"
+        else:
+            return "default-llm"
+
+    async def _call_model(self, model_name: str, prompt: str) -> str:
+        """Delegate to a model-specific client."""
+        endpoint = self.model_endpoints[model_name]
+        # This would use a dedicated, optimized model client
+        return await ModelClientRegistry.get_client(model_name).generate(prompt)
+
+# Minimal model client interface
+class ModelClient(ABC):
+    @abstractmethod
+    async def generate(self, prompt: str) -> str:
+        pass
+
+# Registry pattern for managing different model clients
+class ModelClientRegistry:
+    _clients: Dict[str, ModelClient] = {}
+    
+    @classmethod
+    def register_client(cls, model_name: str, client: ModelClient):
+        cls._clients[model_name] = client
+    
+    @classmethod
+    def get_client(cls, model_name: str) -> ModelClient:
+        if model_name not in cls._clients:
+            raise ValueError(f"No client registered for model: {model_name}")
+        return cls._clients[model_name]
+
+# security/middleware.py
+from fastapi import Request, HTTPException
+from fastapi.middleware import Middleware
+from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+import redis.asyncio as redis
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
+import re
+
+# Rate limiting setup
+limiter = Limiter(key_func=get_remote_address)
+redis_conn = redis.from_url("redis://localhost:6379")
+
+class SecurityMiddlewareStack:
+    """Factory for security middleware stack."""
+    
+    @staticmethod
+    def get_middleware() -> list:
+        return [
+            Middleware(HTTPSRedirectMiddleware),  # Force HTTPS
+            Middleware(SlowAPIMiddleware),  # Rate limiting
+            Middleware(ContentSecurityPolicyMiddleware),
+            Middleware(InputValidationMiddleware),
+            Middleware(LoggingMiddleware),
+        ]
+
+class ContentSecurityPolicyMiddleware(BaseHTTPMiddleware):
+    """Set security headers."""
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = "default-src 'self'"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+class InputValidationMiddleware(BaseHTTPMiddleware):
+    """Validate input to prevent injection attacks."""
+    async def dispatch(self, request: Request, call_next):
+        if request.method in ["POST", "PUT"]:
+            body = await request.body()
+            if self._contains_malicious_content(body.decode()):
+                raise HTTPException(400, "Invalid input detected")
+        return await call_next(request)
+    
+    def _contains_malicious_content(self, text: str) -> bool:
+        patterns = [
+            r"(?i)<script.*?>",  # Script tags
+            r"javascript:",      # JavaScript protocol
+            r"onerror\s*=",      # Event handlers
+            r"union.*select",    # SQL injection
+            r";\s*--",           # SQL comment injection
+        ]
+        return any(re.search(pattern, text) for pattern in patterns)
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    """Structured security logging."""
+    async def dispatch(self, request: Request, call_next):
+        logger.info("Request started", extra={
+            "path": request.url.path,
+            "method": request.method,
+            "ip": request.client.host,
+            "user_agent": request.headers.get("user-agent")
+        })
+        
+        response = await call_next(request)
+        
+        logger.info("Request completed", extra={
+            "path": request.url.path,
+            "method": request.method,
+            "status_code": response.status_code,
+            "ip": request.client.host
+        })
+        
+        return response
+
+# infrastructure/health.py
+from fastapi import APIRouter, Depends
+from typing import Dict, Any
+import psutil
+import json
+
+router = APIRouter()
+
+@router.get("/health")
+async def health_check() -> Dict[str, Any]:
+    """Comprehensive health check endpoint."""
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "components": {
+            "api": await _check_api_health(),
+            "models": await _check_models_health(),
+            "database": await _check_db_health(),
+            "memory": await _check_memory_health(),
+            "storage": await _check_storage_health()
+        }
+    }
+
+@router.get("/ready")
+async def readiness_probe() -> Dict[str, Any]:
+    """Kubernetes readiness probe."""
+    checks = await health_check()
+    all_healthy = all(
+        component["status"] == "healthy" 
+        for component in checks["components"].values()
+    )
+    
+    status_code = 200 if all_healthy else 503
+    return JSONResponse(
+        content=checks,
+        status_code=status_code
+    )
+
+async def _check_memory_health() -> Dict[str, Any]:
+    """Check system memory usage."""
+    memory = psutil.virtual_memory()
+    return {
+        "status": "healthy" if memory.percent < 85 else "warning",
+        "percent_used": memory.percent,
+        "available_gb": round(memory.available / (1024 ** 3), 1)
+    }
+
+async def _check_models_health() -> Dict[str, Any]:
+    """Check all model endpoints."""
+    health_status = {}
+    for model_name, endpoint in orchestrator.model_endpoints.items():
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{endpoint}/health")
+                health_status[model_name] = {
+                    "status": "healthy" if response.status_code == 200 else "unhealthy",
+                    "latency": response.elapsed.total_seconds()
+                }
+        except Exception as e:
+            health_status[model_name] = {
+                "status": "unhealthy",
+                "error": str(e)
+            }
+    
+    return health_status
+
+# config.py
+from pydantic import BaseSettings, Field, RedisDsn, AnyUrl
+from typing import Optional, List
+from functools import lru_cache
+
+class Settings(BaseSettings):
+    # Environment
+    environment: str = Field("production", env="ENVIRONMENT")
+    debug: bool = Field(False, env="DEBUG")
+    
+    # Security
+    secret_key: str = Field(..., env="SECRET_KEY")
+    cors_origins: List[str] = Field(["https://yourdomain.com"], env="CORS_ORIGINS")
+    
+    # Redis
+    redis_url: RedisDsn = Field("redis://localhost:6379/0", env="REDIS_URL")
+    
+    # Model endpoints
+    model_endpoints: Dict[str, AnyUrl] = Field(
+        {
+            "default-llm": "http://llm-service:8000",
+            "vision-model": "http://vision-service:8001",
+            "code-model": "http://code-service:8002"
+        },
+        env="MODEL_ENDPOINTS"
+    )
+    
+    # Rate limiting
+    rate_limit_per_minute: int = Field(60, env="RATE_LIMIT_PER_MINUTE")
+    
+    # Database
+    database_url: Optional[AnyUrl] = Field(None, env="DATABASE_URL")
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
+@lru_cache()
+def get_settings() -> Settings:
+    return Settings()
+
+# Usage: settings = get_settings()
+
 
     
