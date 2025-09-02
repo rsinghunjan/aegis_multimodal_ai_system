@@ -755,3 +755,463 @@ def call_safety_model(text: str):
     response.raise_for_status()
     return response.json()
 
+# model_manager.py
+import threading
+from typing import Dict
+from model_registry import ModelRegistry  # Hypothetical model catalog
+import time
+
+class ModelManager:
+    def __init__(self):
+        self.loaded_models: Dict[str, dict] = {}
+        self.lock = threading.RLock()
+        self.registry = ModelRegistry()
+
+    def get_model(self, model_id: str):
+        with self.lock:
+            if model_id not in self.loaded_models:
+                # Load the model into memory
+                model_info = self.registry.get_model(model_id)
+                print(f"Loading model {model_id} into GPU memory...")
+                # ... Logic to load the model onto the GPU ...
+                model = load_model_from_disk(model_info["path"])
+                self.loaded_models[model_id] = {
+                    "model": model,
+                    "last_used": time.time(),
+                    "load_count": 1
+                }
+            else:
+                self.loaded_models[model_id]["last_used"] = time.time()
+                self.loaded_models[model_id]["load_count"] += 1
+            return self.loaded_models[model_id]["model"]
+
+    def unload_idle_models(self, idle_time_sec=300):
+        with self.lock:
+            current_time = time.time()
+            models_to_unload = []
+            for model_id, info in self.loaded_models.items():
+                if current_time - info["last_used"] > idle_time_sec:
+                    models_to_unload.append(model_id)
+            
+            for model_id in models_to_unload:
+                print(f"Unloading idle model: {model_id}")
+                # ... Logic to gracefully unload model from GPU ...
+                del self.loaded_models[model_id]
+
+# Start a background thread to periodically unload idle models
+def cleanup_thread(model_manager):
+    while True:
+        time.sleep(60)  # Check every minute
+        model_manager.unload_idle_models()
+
+model_manager = ModelManager()
+threading.Thread(target=cleanup_thread, args=(model_manager,), daemon=True).start()
+
+# semantic_cache.py
+from redis import Redis
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+class SemanticCache:
+    def __init__(self, host='redis-host', port=6379, threshold=0.9):
+        self.redis = Redis(host=host, port=port, decode_responses=True)
+        self.encoder = SentenceTransformer('all-MiniLM-L6-v2')  # Small, fast model
+        self.similarity_threshold = threshold
+
+    def _get_key(self, text: str) -> str:
+        embedding = self.encoder.encode(text)
+        return f"embedding:{hash(embedding.tobytes())}"
+
+    def get(self, user_input: str):
+        input_key = self._get_key(user_input)
+        # Get all keys for similar embeddings
+        all_cache_keys = self.redis.keys("cache:*")
+        for cache_key in all_cache_keys:
+            stored_embedding_key = self.redis.hget(cache_key, 'embedding_key')
+            if stored_embedding_key == input_key:
+                return self.redis.hget(cache_key, 'response')
+        return None
+
+    def set(self, user_input: str, response: str):
+        input_key = self._get_key(user_input)
+        cache_key = f"cache:{uuid.uuid4()}"
+        self.redis.hset(cache_key, mapping={
+            'embedding_key': input_key,
+            'response': response,
+            'original_input': user_input
+        })
+        self.redis.expire(cache_key, 3600)  # Expire in 1 hour
+
+# Usage in the endpoint
+semantic_cache = SemanticCache()
+
+@app_fastapi.post("/chat")
+async def chat_endpoint(request: AnalysisRequest):
+    # Check cache first
+    cached_response = semantic_cache.get(request.user_input)
+    if cached_response:
+        return {"response": cached_response, "source": "cache"}
+    
+    # ... process request with models if not in cache ...
+    semantic_cache.set(request.user_input, final_response)
+    return {"response": final_response, "source": "models"}
+
+# main.py (The Core FastAPI Server)
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from redis.asyncio import Redis, ConnectionPool
+from celery import Celery
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, RetryError
+from typing import Optional, Dict
+import uuid
+import time
+
+# --- Models & Config ---
+class InferenceRequest(BaseModel):
+    prompt: str
+    model: Optional[str] = "default"
+    session_id: Optional[str] = None
+
+# --- Lifespan Management (Resource Initialization/Cleanup) ---
+redis_pool = ConnectionPool(host='localhost', port=6379, db=0, decode_responses=True)
+celery_app = Celery('aegis_tasks', broker='redis://localhost:6379/0')
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize resources (pools are lazy-loaded, but this is explicit)
+    app.state.redis = Redis(connection_pool=redis_pool)
+    app.state.http_client = httpx.AsyncClient() # HTTPX Connection Pool
+    yield
+    # Shutdown: Cleanup resources gracefully
+    await app.state.redis.close()
+    await app.state.http_client.accept()
+
+app = FastAPI(lifespan=lifespan, title="Aegis Robust API")
+
+# --- Dependencies (Dependency Injection) ---
+async def get_redis() -> Redis:
+    async with Redis(connection_pool=redis_pool) as redis:
+        yield redis
+
+# --- Core Services ---
+
+# **1. Caching Service (Semantic Cache)**
+class SemanticCache:
+    def __init__(self, redis: Redis):
+        self.redis = redis
+
+    async def get(self, prompt: str) -> Optional[str]:
+        """Simple non-semantic key for demo. For a real semantic cache, you'd use a vector DB or generate a semantic key."""
+        key = f"cache:prompt:{hash(prompt)}"
+        return await self.redis.get(key)
+
+    async def set(self, prompt: str, response: str, ttl: int = 3600):
+        key = f"cache:prompt:{hash(prompt)}"
+        await self.redis.setex(key, ttl, response)
+
+# **2. Resilience & Circuit Breaker Service**
+class CircuitBreaker:
+    def __init__(self, redis: Redis, name: str, failure_threshold: int = 5, reset_timeout: int = 60):
+        self.redis = redis
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+
+    async def is_open(self) -> bool:
+        key = f"circuit_breaker:{self.name}:failures"
+        failures = await self.redis.get(key)
+        return int(failures or 0) >= self.failure_threshold
+
+    async def record_failure(self):
+        key = f"circuit_breaker:{self.name}:failures"
+        await self.redis.incr(key)
+        await self.redis.expire(key, self.reset_timeout)
+
+    async def record_success(self):
+        key = f"circuit_breaker:{self.name}:failures"
+        await self.redis.delete(key)
+
+# **3. Async Model Client with Retry & Circuit Breaker**
+class ModelClient:
+    def __init__(self, http_client: httpx.AsyncClient, redis: Redis, model_base_url: str):
+        self.http_client = http_client
+        self.cb = CircuitBreaker(redis, name=f"model_{model_base_url}")
+        self.model_base_url = model_base_url
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception((httpx.RequestError, HTTPException))
+    )
+    async def generate(self, prompt: str) -> str:
+        # Check circuit breaker first
+        if await self.cb.is_open():
+            raise HTTPException(503, detail=f"Circuit breaker for {self.model_base_url} is open. Service unavailable.")
+
+        try:
+            response = await self.http_client.post(
+                f"{self.model_base_url}/generate",
+                json={"prompt": prompt},
+                timeout=10.0 # Critical timeout
+            )
+            response.raise_for_status()
+            await self.cb.record_success() # Success! Reset CB.
+            return response.json()["text"]
+        except httpx.RequestError as e:
+            await self.cb.record_failure()
+            raise e
+
+# --- API Endpoints ---
+
+@app.post("/generate")
+async def generate_text(
+    request: InferenceRequest,
+    background_tasks: BackgroundTasks,
+    redis: Redis = Depends(get_redis)
+):
+    # 1. Check Cache First
+    cache = SemanticCache(redis)
+    cached_response = await cache.get(request.prompt)
+    if cached_response:
+        return JSONResponse(
+            content={"response": cached_response, "source": "cache"},
+            status_code=200
+        )
+
+    # 2. Initiate Async Processing
+    task_id = str(uuid.uuid4())
+    # In a real app, you'd store the task_id and prompt in Redis for status tracking
+    background_tasks.add_task(process_inference_task, request.prompt, task_id)
+
+    return JSONResponse(
+        content={"message": "Processing started asynchronously", "task_id": task_id, "status": "accepted"},
+        status_code=202 # Accepted
+    )
+
+@app.get("/task/{task_id}")
+async def get_task_status(task_id: str, redis: Redis = Depends(get_redis)):
+    """Endpoint to poll for the result of an async task."""
+    result = await redis.get(f"task:result:{task_id}")
+    if not result:
+        return {"status": "processing"}
+    return {"status": "complete", "result": result}
+
+# --- Celery Task (Async Worker) ---
+@celery_app.task
+def process_inference_task(prompt: str, task_id: str):
+    """
+    This task runs in the background Celery worker pool.
+    It uses a synchronous Redis client and HTTP client.
+    """
+    # ... (Synchronous implementations of Cache, CircuitBreaker, and model calls would go here) ...
+    # For simplicity, let's simulate work.
+    time.sleep(5) # Simulate model inference time
+    result = f"Processed: {prompt}"
+
+    # Store the result in Redis so the /task endpoint can find it.
+    # Use a synchronous redis client
+    sync_redis = Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    sync_redis.setex(f"task:result:{task_id}", 300, result) # Result expires in 5 min
+    sync_redis.close()
+
+    return result
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# This is a concept for a core Aegis management API
+class AegisModelManager:
+    def __init__(self, model_hub_url=None, trusted_registry_only=True):
+        # Prong 1: Sovereignty - Can run entirely offline
+        self.offline_mode = model_hub_url is None
+        if self.offline_mode:
+            self.model_registry = LocalModelRegistry() # Uses a local, air-gapped catalog
+        else:
+            # Prong 2: Open Ecosystem - Connects to the curated hub
+            self.model_registry = CertifiedModelHub(model_hub_url, trusted_registry_only)
+
+    def deploy_model(self, model_id, version="latest", deployment_config):
+        """Deploys a model from a trusted source with verified checksums."""
+        # 1. Download from trusted source or verify local copy
+        model_path, config = self.model_registry.get_model(model_id, version)
+
+        # 2. Verify integrity (Prong 1: Security)
+        if not self._verify_model_signature(model_path, config['signature']):
+            raise SecurityException("Model integrity check failed! Potential tampering.")
+
+        # 3. Load model into optimized runtime (e.g., vLLM, TensorRT)
+        engine = self._load_model_engine(model_path, deployment_config)
+
+        # 4. Register model in the orchestration router
+        self.orchestrator.register_model(
+            model_id=model_id,
+            engine=engine,
+            capabilities=config['capabilities'] # e.g., ["text-gen", "reasoning", "code"]
+        )
+
+        # 5. (Optional) Start A/B testing cohort if configured
+        if deployment_config.get('ab_test_group'):
+            self.ab_tester.add_model(model_id, deployment_config['ab_test_group'])
+
+    def _verify_model_signature(self, model_path, expected_signature):
+        # Uses cryptographic signing to ensure model bits haven't been altered
+        import hashlib
+        with open(model_path, 'rb') as f:
+            file_hash = hashlib.sha256(f.read()).hexdigest()
+        return file_hash == expected_signature
+
+# Example Usage for a highly secure environment:
+# This runs without any internet connection, using pre-vetted models.
+manager = AegisModelManager() # No URL = offline mode
+manager.deploy_model(
+    model_id="meta-llama-3-70b-instruct",
+    version="aegis-verified-v1.0", # Uses a certified, tested version
+    deployment_config={"gpu_memory": "40GB", "ab_test_group": "group_a"}
+)
+
+# hallucination_guard.py
+import logging
+from typing import Dict, List, Optional, Tuple
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+class HallucinationGuard:
+    def __init__(self, web_search_api_key: Optional[str] = None):
+        self.web_search_api_key = web_search_api_key
+        self.http_client = httpx.AsyncClient(timeout=30.0)
+        self.logger = logging.getLogger(__name__)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.http_client.aclose()
+
+    async def _call_model(self, prompt: str, model_endpoint: str) -> str:
+        """Helper function to call a model endpoint."""
+        try:
+            response = await self.http_client.post(
+                model_endpoint,
+                json={"prompt": prompt},
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            return response.json().get("text", "")
+        except httpx.RequestError as e:
+            self.logger.error(f"Error calling model at {model_endpoint}: {e}")
+            raise
+
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def _web_search_verify(self, claim: str) -> List[Dict]:
+        """Use a web search API to verify a factual claim. Returns snippets."""
+        if not self.web_search_api_key:
+            return []
+
+        try:
+            # Example using a hypothetical SerpAPI or Bing Search API
+            params = {
+                "q": claim,
+                "api_key": self.web_search_api_key,
+                "num": 3  # Get top 3 results
+            }
+            response = await self.http_client.get(
+                "https://serpapi.com/search",
+                params=params
+            )
+            data = response.json()
+            # Extract snippets from search results
+            snippets = [result.get("snippet") for result in data.get("organic_results", []) if "snippet" in result]
+            return snippets
+        except Exception as e:
+            self.logger.error(f"Web search verification failed: {e}")
+            return []
+
+    async def _check_against_sources(self, claim: str, sources: List[str]) -> float:
+        """
+        Simple heuristic to check if a claim is supported by source text.
+        Returns a confidence score between 0 and 1.
+        """
+        if not sources:
+            return 0.0  # No sources to verify against
+
+        claim_lower = claim.lower()
+        supporting_sources = 0
+
+        for source in sources:
+            if source and source.lower() in claim_lower:
+                supporting_sources += 1
+            # A more advanced version would use embedding similarity here
+
+        return supporting_sources / len(sources)
+
+    async def generate_with_guardrails(self, user_query: str, context: Optional[str] = None) -> Dict:
+        """
+        The main method to generate a response with anti-hallucination guardrails.
+        Returns a dict containing the response, confidence, and sources.
+        """
+
+        # Step 1: Generate the initial response with a primary model
+        initial_response = await self._call_model(
+            f"Answer the following query based on the provided context. If the answer isn't in the context, say 'I don't know'.\nQuery: {user_query}\nContext: {context}",
+            "http://llm-model-server:8000/generate"
+        )
+
+        # Step 2: Perform self-critique
+        critique_prompt = f"""
+        You are a fact-checker. Analyze the following response for inaccuracies or unsupported claims.
+
+        Original Query: {user_query}
+        Response to Critique: {initial_response}
+
+        List any potential hallucinations or inaccuracies. If everything seems accurate, say 'ALL_CHECKS_PASSED'.
+        """
+        critique = await self._call_model(critique_prompt, "http://llm-model-server:8000/generate")
+
+        # Step 3: If critique found issues, correct the response
+        if "ALL_CHECKS_PASSED" not in critique:
+            self.logger.warning(f"Self-critique flagged response: {critique}")
+            correction_prompt = f"""
+            The previous response was flagged for potential inaccuracies: {critique}
+            Original Query: {user_query}
+            Please rewrite the response to be accurate and avoid any unsupported claims.
+            """
+            initial_response = await self._call_model(correction_prompt, "http://llm-model-server:8000/generate")
+
+        # Step 4: For factual claims, perform web search verification
+        verification_snippets = []
+        confidence = 0.5  # Default neutral confidence
+
+        # Extract a factual claim from the response (simplified)
+        if context is None and "is" in initial_response and "I don't know" not in initial_response:
+            verification_snippets = await self._web_search_verify(initial_response)
+            confidence = await self._check_against_sources(initial_response, verification_snippets)
+
+        # Step 5: Final truthfulness check with a dedicated guardrail model
+        guardrail_prompt = f"""
+        Is the following response supported by the context and factually accurate?
+        Respond only with 'YES' or 'NO' and a confidence score between 0-1.
+
+        Query: {user_query}
+        Response: {initial_response}
+        Context: {context}
+        """
+        guardrail_check = await self._call_model(guardrail_prompt, "http://guardrail-model:8001/check")
+        guardrail_result = guardrail_check.strip().split()
+
+        if guardrail_result and guardrail_result[0] == 'NO':
+            self.logger.error("Guardrail model blocked the response.")
+            initial_response = "I cannot provide a verified answer to that question at this time."
+
+        # Compile the final output with metadata
+        return {
+            "response": initial_response,
+            "confidence": confidence,
+            "sources": verification_snippets[:2],  # Return top 2 sources
+            "was_verified": len(verification_snippets) > 0,
+            "guardrail_result": guardrail_check
+        }
+
