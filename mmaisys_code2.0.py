@@ -1621,4 +1621,137 @@ def complex_query_processor(query: str):
 if __name__ == "__main__":
     asyncio.run(main())
 
+# workflow_dsl.py
+from pydantic import BaseModel, Field
+from enum import Enum
+from typing import List, Dict, Any, Optional, Union
+
+class NodeType(str, Enum):
+    LLM = "llm"
+    VISION = "vision"
+    TEXT_INPUT = "text_input"
+    TEXT_OUTPUT = "text_output"
+    CONDITION = "condition"
+    DATA_LOADER = "data_loader"
+    API_CALL = "api_call"
+
+class WorkflowNode(BaseModel):
+    id: str
+    type: NodeType
+    parameters: Dict[str, Any] = {}
+    position: Dict[str, float]  # x, y coordinates on canvas
+
+class WorkflowConnection(BaseModel):
+    id: str
+    source_node_id: str
+    target_node_id: str
+    source_socket: str = "output"  # e.g., "output", "yes", "no"
+    target_socket: str = "input"   # e.g., "input", "condition"
+
+class WorkflowDefinition(BaseModel):
+    name: str
+    version: str = "1.0"
+    nodes: List[WorkflowNode]
+    connections: List[WorkflowConnection]
+
+# workflow_engine.py
+import asyncio
+from workflow_dsl import WorkflowDefinition, NodeType
+
+class WorkflowEngine:
+    def __init__(self, aegis_core):
+        self.aegis = aegis_core
+        self.node_handlers = {
+            NodeType.TEXT_INPUT: self._handle_text_input,
+            NodeType.LLM: self._handle_llm,
+            NodeType.CONDITION: self._handle_condition,
+            # ... handlers for other node types ...
+        }
+
+    async def execute_workflow(self, workflow: WorkflowDefinition, initial_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a workflow definition."""
+        # Create a context to store data at each node
+        node_context = {node.id: {} for node in workflow.nodes}
+        execution_queue = []
+
+        # Find start nodes (nodes with no inputs)
+        for node in workflow.nodes:
+            if not any(conn.target_node_id == node.id for conn in workflow.connections):
+                execution_queue.append(node)
+
+        # Process the queue
+        while execution_queue:
+            current_node = execution_queue.pop(0)
+            handler = self.node_handlers.get(current_node.type)
+            
+            if handler:
+                # Get input data from connected nodes
+                input_data = {}
+                for conn in workflow.connections:
+                    if conn.target_node_id == current_node.id:
+                        input_data[conn.target_socket] = node_context[conn.source_node_id].get(conn.source_socket, {})
+                
+                # Execute the node
+                output = await handler(current_node, input_data, initial_data)
+                node_context[current_node.id] = output
+
+                # Find next nodes to execute
+                for conn in workflow.connections:
+                    if conn.source_node_id == current_node.id:
+                        next_node = next((n for n in workflow.nodes if n.id == conn.target_node_id), None)
+                        if next_node and next_node not in execution_queue:
+                            execution_queue.append(next_node)
+
+        # Find output nodes and return their data
+        results = {}
+        for node in workflow.nodes:
+            if node.type == NodeType.TEXT_OUTPUT:
+                results[node.id] = node_context[node.id]
+        return results
+
+    async def _handle_llm(self, node: WorkflowNode, inputs: Dict, initial_data: Dict) -> Dict:
+        """Execute an LLM node."""
+        prompt_template = node.parameters.get("prompt", "")
+        # Replace variables in the prompt: e.g., {{input}} -> actual input data
+        filled_prompt = prompt_template.replace("{{input}}", inputs.get("input", ""))
+        
+        model_name = node.parameters.get("model", "llama3-8b")
+        response = await self.aegis.models[model_name].generate(filled_prompt)
+        
+        return {"output": response}
+
+    async def _handle_condition(self, node: WorkflowNode, inputs: Dict, initial_data: Dict) -> Dict:
+        """Execute a condition node."""
+        condition_value = inputs.get("input", "")
+        # Simple condition check: if input contains "error", go to 'no' branch
+        if "error" in condition_value.lower():
+            return {"yes": None, "no": condition_value}
+        else:
+            return {"yes": condition_value, "no": None}
+
+# Example usage
+workflow_def = WorkflowDefinition(
+    name="Content Moderation Workflow",
+    nodes=[
+        WorkflowNode(id="1", type=NodeType.TEXT_INPUT, parameters={}),
+        WorkflowNode(id="2", type=NodeType.LLM, parameters={
+            "model": "safety-checker",
+            "prompt": "Is this content appropriate?: {{input}}"
+        }),
+        WorkflowNode(id="3", type=NodeType.CONDITION, parameters={}),
+        WorkflowNode(id="4", type=NodeType.TEXT_OUTPUT, parameters={"label": "Approved"}),
+        WorkflowNode(id="5", type=NodeType.TEXT_OUTPUT, parameters={"label": "Rejected"})
+    ],
+    connections=[
+        WorkflowConnection(id="c1", source_node_id="1", target_node_id="2"),
+        WorkflowConnection(id="c2", source_node_id="2", target_node_id="3", source_socket="output", target_socket="input"),
+        WorkflowConnection(id="c3", source_node_id="3", target_node_id="4", source_socket="yes", target_socket="input"),
+        WorkflowConnection(id="c4", source_node_id="3", target_node_id="5", source_socket="no", target_socket="input")
+    ]
+)
+
+# Execute the workflow
+engine = WorkflowEngine(aegis_core)
+result = await engine.execute_workflow(workflow_def, {"input": "This is a nice comment"})
+
 
