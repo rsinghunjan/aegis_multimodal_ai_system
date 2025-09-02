@@ -1215,3 +1215,38 @@ class HallucinationGuard:
             "guardrail_result": guardrail_check
         }
 
+from fastapi import FastAPI, HTTPException, Depends
+from contextlib import asynccontextmanager
+from hallucination_guard import HallucinationGuard
+import os
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    app.state.hallucination_guard = HallucinationGuard(
+        web_search_api_key=os.getenv("WEB_SEARCH_API_KEY")
+    )
+    yield
+    # Shutdown
+    await app.state.hallucination_guard.http_client.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/query")
+async def safe_query_endpoint(user_query: str, context: str = None):
+    """
+    Endpoint for generating responses with anti-hallucination guardrails.
+    """
+    try:
+        async with app.state.hallucination_guard as guard:
+            result = await guard.generate_with_guardrails(user_query, context)
+        
+        # Apply a confidence threshold
+        if result["confidence"] < 0.7 and result["was_verified"]:
+            result["response"] = "I'm not entirely confident about this. Based on my search, I found: " + result["response"]
+        
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
+
