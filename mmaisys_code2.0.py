@@ -1494,6 +1494,130 @@ async def main():
     monitor = SelfHealingMonitor()
     await monitor.check_health()
 
+# dynamic_router.py
+import numpy as np
+from collections import defaultdict
+import time
+from typing import Dict, List, Any
+import logging
+
+class DynamicRouter:
+    def __init__(self, model_endpoints: List[str]):
+        self.models = model_endpoints
+        # Initialize metrics: [success_rate, avg_latency, cost_per_call]
+        self.metrics = {model: [0.8, 1.0, 1.0] for model in model_endpoints}
+        self.logger = logging.getLogger(__name__)
+
+    def update_metrics(self, model: str, success: bool, latency: float):
+        """Update metrics based on the result of a request."""
+        old_sr, old_lat, old_cost = self.metrics[model]
+        new_sr = (old_sr * 0.9) + (0.1 * (1.0 if success else 0.0))  # Moving average
+        new_lat = (old_lat * 0.9) + (0.1 * latency)
+        
+        self.metrics[model] = [new_sr, new_lat, old_cost] # Cost is static for now
+        self.logger.info(f"Updated metrics for {model}: SR={new_sr:.3f}, Latency={new_lat:.3f}")
+
+    def choose_model(self, query: str, context: Dict[str, Any]) -> str:
+        """Choose a model based on a weighted score of its metrics."""
+        scores = {}
+        for model, (sr, lat, cost) in self.metrics.items():
+            # Convert metrics to a score (higher is better). This is a simple heuristic.
+            # Weigh success rate most heavily, then inverse latency, then inverse cost.
+            score = (sr * 0.7) + ((1/lat) * 0.2) + ((1/cost) * 0.1)
+            scores[model] = score
+        
+        # Softmax selection: mostly choose the best, but occasionally explore others to keep metrics fresh.
+        model_names = list(scores.keys())
+        model_scores = np.array([scores[m] for m in model_names])
+        exp_scores = np.exp(model_scores - np.max(model_scores)) # Stability trick
+        probabilities = exp_scores / exp_scores.sum()
+        
+        chosen_model = np.random.choice(model_names, p=probabilities)
+        self.logger.info(f"Routing query to {chosen_model} with probability {probabilities[model_names.index(chosen_model)]:.3f}")
+        return chosen_model
+
+# Usage in the main API endpoint
+router = DynamicRouter(["http://llama-server:8001", "http://deepseek-server:8002"])
+
+@app.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+    start_time = time.time()
+    chosen_model_url = router.choose_model(request.prompt, {})
+    
+    try:
+        response = await call_model(chosen_model_url, request.prompt)
+        latency = time.time() - start_time
+        router.update_metrics(chosen_model_url, success=True, latency=latency)
+        return response
+    except Exception as e:
+        latency = time.time() - start_time
+        router.update_metrics(chosen_model_url, success=False, latency=latency)
+        raise HTTPException(500, "Model request failed")
+
+# reasoning_trace.py
+from pydantic import BaseModel
+from enum import Enum
+from typing import List, Optional, Dict, Any
+import json
+import datetime
+
+class StepType(Enum):
+    TOOL_CALL = "tool_call"
+    MODEL_QUERY = "model_query"
+    DATA_RETRIEVAL = "data_retrieval"
+    SAFETY_CHECK = "safety_check"
+
+class ReasoningStep(BaseModel):
+    step_type: StepType
+    description: str
+    input_data: Optional[Dict[str, Any]] = None
+    output_data: Optional[Dict[str, Any]] = None
+    timestamp: datetime.datetime
+    model_used: Optional[str] = None
+    confidence: Optional[float] = None
+
+class ReasoningTracer:
+    def __init__(self):
+        self.steps: List[ReasoningStep] = []
+    
+    def add_step(self, step_type: StepType, description: str, input_data: Optional[Dict] = None, output_data: Optional[Dict] = None, model_used: Optional[str] = None, confidence: Optional[float] = None):
+        step = ReasoningStep(
+            step_type=step_type,
+            description=description,
+            input_data=input_data,
+            output_data=output_data,
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+            model_used=model_used,
+            confidence=confidence
+        )
+        self.steps.append(step)
+        return step
+
+    def generate_trace_report(self) -> str:
+        """Generate a human-readable or JSON report of the reasoning process."""
+        report = {
+            "summary": f"Process completed in {len(self.steps)} steps.",
+            "steps": [json.loads(step.json()) for step in self.steps] # Convert Pydantic models to dicts
+        }
+        return json.dumps(report, indent=2, default=str)
+
+# Usage within a function
+tracer = ReasoningTracer()
+
+def complex_query_processor(query: str):
+    tracer.add_step(StepType.MODEL_QUERY, "Initial query decomposition", input_data={"query": query}, model_used="llama3-8b")
+    # ... processing logic ...
+    tracer.add_step(StepType.TOOL_CALL, "Called web search API for verification", input_data={"search_query": "current weather NYC"}, output_data={"result": " sunny, 72F"})
+    # ... more processing ...
+    final_answer = "The weather is nice in New York today."
+    tracer.add_step(StepType.SAFETY_CHECK, "Final output safety review", input_data={"text": final_answer}, output_data={"is_safe": True}, confidence=0.95)
+    
+    return final_answer, tracer.generate_trace_report()
+
+# The endpoint would return both the answer and the trace
+
+
+
 if __name__ == "__main__":
     asyncio.run(main())
 
