@@ -3067,6 +3067,62 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     return Settings()
 
+# monitoring/metrics.py
+from prometheus_client import Counter, Gauge, Histogram, generate_latest
+from prometheus_fastapi_instrumentator import Instrumentator
+
+# Application metrics
+REQUEST_COUNT = Counter(
+    'aegis_requests_total',
+    'Total requests',
+    ['method', 'endpoint', 'status_code']
+)
+
+REQUEST_DURATION = Histogram(
+    'aegis_request_duration_seconds',
+    'Request duration',
+    ['method', 'endpoint']
+)
+
+ACTIVE_REQUESTS = Gauge(
+    'aegis_active_requests',
+    'Active requests'
+)
+
+MODEL_LATENCY = Histogram(
+    'aegis_model_latency_seconds',
+    'Model response latency',
+    ['model_name']
+)
+
+def setup_metrics(app):
+    """Set up Prometheus metrics for the application."""
+    Instrumentator().instrument(app).expose(app)
+    
+    @app.middleware("http")
+    async def track_metrics(request: Request, call_next):
+        ACTIVE_REQUESTS.inc()
+        start_time = time.time()
+        
+        response = await call_next(request)
+        
+        duration = time.time() - start_time
+        REQUEST_DURATION.labels(
+            method=request.method,
+            endpoint=request.url.path
+        ).observe(duration)
+        
+        REQUEST_COUNT.labels(
+            method=request.method,
+            endpoint=request.url.path,
+            status_code=response.status_code
+        ).inc()
+        
+        ACTIVE_REQUESTS.dec()
+        return response
+
+
+
 # Usage: settings = get_settings()
 
 
