@@ -3765,5 +3765,1715 @@ class AdversarialRobustness:
             'robustness_gap': (clean_accuracy - adversarial_accuracy) / len(dataloader)
         }
 
+import torch
+from torch.utils.data import Dataset, DataLoader
+from typing import Dict, List, Callable, Optional, Union
+import pandas as pd
+from pathlib import Path
+import json
+import logging
+from PIL import Image
+import torchaudio
+import numpy as np
 
+logger = logging.getLogger(__name__)
 
+class MultimodalDataset(Dataset):
+    def __init__(self, 
+                 data_config: Dict,
+                 split: str = 'train',
+                 transforms: Optional[Dict[str, Callable]] = None,
+                 max_samples: Optional[int] = None):
+        """
+        Advanced multimodal dataset handler
+        
+        Args:
+            data_config: Configuration dictionary with data paths
+            split: Dataset split ('train', 'val', 'test')
+            transforms: Dictionary of transforms per modality
+            max_samples: Maximum number of samples to load
+        """
+        self.data_config = data_config
+        self.split = split
+        self.transforms = transforms or {}
+        self.max_samples = max_samples
+        
+        self._load_data_manifest()
+        self._validate_data()
+        self._create_modality_mappings()
+        
+        logger.info(f"Loaded {len(self)} samples for {split} split")
+
+    def _load_data_manifest(self):
+        """Load data manifest file or create from directory structure"""
+        manifest_path = self.data_config.get('manifest_path')
+        
+        if manifest_path and Path(manifest_path).exists():
+            self.manifest = pd.read_csv(manifest_path)
+            logger.info(f"Loaded manifest from {manifest_path}")
+        else:
+            self.manifest = self._create_manifest_from_dir()
+            logger.info("Created manifest from directory structure")
+        
+        if self.max_samples:
+            self.manifest = self.manifest.head(self.max_samples)
+
+    def _create_manifest_from_dir(self) -> pd.DataFrame:
+        """Create data manifest from directory structure"""
+        base_path = Path(self.data_config['data_root'])
+        data = []
+        
+        # Support multiple data formats
+        for modality, modality_config in self.data_config['modalities'].items():
+            modality_path = base_path / modality_config['path'] / self.split
+            if modality_path.exists():
+                for file_path in modality_path.glob(f"*{modality_config.get('extension', '.*')}"):
+                    sample_id = file_path.stem.split('_')[0]  # Extract sample ID
+                    data.append({'sample_id': sample_id, modality: str(file_path)})
+        
+        # Convert to DataFrame and merge by sample_id
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df = df.groupby('sample_id').agg(lambda x: x.iloc[0] if len(x) == 1 else list(x)).reset_index()
+        
+        return df
+
+    def _validate_data(self):
+        """Validate data integrity and availability"""
+        if self.manifest.empty:
+            raise ValueError("No data found in manifest")
+        
+        # Check for required modalities
+        required_modalities = self.data_config.get('required_modalities', [])
+        for modality in required_modalities:
+            if modality not in self.manifest.columns or self.manifest[modality].isna().all():
+                raise ValueError(f"Required modality {modality} not found in data")
+
+    def _create_modality_mappings(self):
+        """Create modality-specific configuration mappings"""
+        self.modality_loaders = {
+            'image': self._load_image,
+            'text': self._load_text,
+            'audio': self._load_audio
+        }
+        
+        self.modality_defaults = {
+            'image': torch.zeros(3, 224, 224),
+            'text': '',
+            'audio': torch.zeros(1, 16000)
+        }
+
+    def __len__(self):
+        return len(self.manifest)
+
+    def __getitem__(self, idx):
+        try:
+            sample = self.manifest.iloc[idx]
+            sample_id = sample.get('sample_id', str(idx))
+            
+            result = {
+                'sample_id': sample_id,
+                'inputs': {},
+                'labels': {},
+                'metadata': {}
+            }
+            
+            # Load each modality
+            for modality in self.data_config['modalities']:
+                if modality in sample and not pd.isna(sample[modality]):
+                    result['inputs'][modality] = self._load_modality(modality, sample[modality])
+                else:
+                    result['inputs'][modality] = self.modality_defaults[modality]
+                    logger.warning(f"Missing {modality} for sample {sample_id}")
+            
+            # Load labels
+            for label_col in self.data_config.get('label_columns', []):
+                if label_col in sample and not pd.isna(sample[label_col]):
+                    result['labels'][label_col] = sample[label_col]
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error loading sample {idx}: {e}")
+            return self._get_fallback_sample(idx)
+
+    def _load_modality(self, modality: str, path: Union[str, List[str]]):
+        """Load a specific modality with error handling"""
+        try:
+            if isinstance(path, list):
+                # Handle multiple files for same modality
+                return [self.modality_loaders[modality](p) for p in path]
+            else:
+                return self.modality_loaders[modality](path)
+        except Exception as e:
+            logger.warning(f"Failed to load {modality} from {path}: {e}")
+            return self.modality_defaults[modality]
+
+    def _load_image(self, path: str) -> torch.Tensor:
+        """Load and preprocess image"""
+        image = Image.open(path).convert('RGB')
+        if 'image' in self.transforms:
+            image = self.transforms['image'](image)
+        return image
+
+    def _load_text(self, path: str) -> str:
+        """Load text data"""
+        with open(path, 'r', encoding='utf-8') as f:
+            text = f.read().strip()
+        if 'text' in self.transforms:
+            text = self.transforms['text'](text)
+        return text
+
+    def _load_audio(self, path: str) -> torch.Tensor:
+        """Load and preprocess audio"""
+        waveform, sample_rate = torchaudio.load(path)
+        if 'audio' in self.transforms:
+            waveform = self.transforms['audio'](waveform, sample_rate)
+        return waveform
+
+    def _get_fallback_sample(self, idx):
+        """Return a fallback sample when loading fails"""
+        return {
+            'sample_id': f'fallback_{idx}',
+            'inputs': {modality: default for modality, default in self.modality_defaults.items()},
+            'labels': {},
+            'metadata': {'is_fallback': True}
+        }
+
+class SmartDataLoader:
+    """Intelligent data loader with automatic batching and collation"""
+    
+    def __init__(self, dataset, batch_size=32, num_workers=4, 
+                 collate_fn=None, shuffle=True, pin_memory=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.collate_fn = collate_fn or self._default_collate
+        self.shuffle = shuffle
+        self.pin_memory = pin_memory
+        
+    def get_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            collate_fn=self.collate_fn,
+            shuffle=self.shuffle,
+            pin_memory=self.pin_memory
+        )
+    
+    def _default_collate(self, batch):
+        """Default collation function for multimodal data"""
+        collated = {'inputs': {}, 'labels': {}, 'sample_ids': [], 'metadata': []}
+        
+        for sample in batch:
+            collated['sample_ids'].append(sample['sample_id'])
+            collated['metadata'].append(sample.get('metadata', {}))
+            
+            # Collate inputs
+            for modality, data in sample['inputs'].items():
+                if modality not in collated['inputs']:
+                    collated['inputs'][modality] = []
+                collated['inputs'][modality].append(data)
+            
+            # Collate labels
+            for label_name, label_value in sample['labels'].items():
+                if label_name not in collated['labels']:
+                    collated['labels'][label_name] = []
+                collated['labels'][label_name].append(label_value)
+        
+        # Convert lists to tensors where possible
+        for modality, data_list in collated['inputs'].items():
+            if all(isinstance(x, torch.Tensor) for x in data_list):
+                try:
+                    collated['inputs'][modality] = torch.stack(data_list)
+                except RuntimeError:
+                    # Handle variable sequence lengths
+                    collated['inputs'][modality] = data_list
+        
+        for label_name, label_list in collated['labels'].items():
+            if all(isinstance(x, torch.Tensor) for x in label_list):
+                collated['labels'][label_name] = torch.stack(label_list)
+            elif all(isinstance(x, (int, float)) for x in label_list):
+                collated['labels'][label_name] = torch.tensor(label_list)
+        
+        return collated
+
+import torch
+import torchvision.transforms as T
+import torchaudio.transforms as AT
+from typing import Dict, Any
+
+def get_default_transforms(modality: str, config: Dict[str, Any] = None):
+    """Get default transforms for each modality"""
+    config = config or {}
+    
+    if modality == 'image':
+        return T.Compose([
+            T.Resize(config.get('image_size', (224, 224))),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    elif modality == 'text':
+        # Text transforms are typically handled by tokenizers
+        return lambda x: x
+    
+    elif modality == 'audio':
+        return T.Compose([
+            AT.MelSpectrogram(sample_rate=config.get('sample_rate', 16000)),
+            AT.AmplitudeToDB()
+        ])
+    
+    else:
+        raise ValueError(f"Unknown modality: {modality}")
+
+class TransformManager:
+    """Manage transforms for different modalities and splits"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.transforms = {}
+        
+    def get_transforms(self, split: str = 'train') -> Dict[str, Callable]:
+        """Get transforms for a specific split"""
+        if split not in self.transforms:
+            self.transforms[split] = self._create_transforms(split)
+        return self.transforms[split]
+    
+    def _create_transforms(self, split: str) -> Dict[str, Callable]:
+        """Create transforms for a specific split"""
+        transforms = {}
+        
+        for modality, modality_config in self.config.items():
+            if split == 'train':
+                # Add augmentation for training
+                transforms[modality] = self._create_train_transforms(modality, modality_config)
+            else:
+                # Basic transforms for validation/test
+                transforms[modality] = get_default_transforms(modality, modality_config)
+        
+        return transforms
+    
+    def _create_train_transforms(self, modality: str, config: Dict[str, Any]) -> Callable:
+        """Create training transforms with augmentation"""
+        if modality == 'image':
+            return T.Compose([
+                T.RandomResizedCrop(config.get('image_size', (224, 224))),
+                T.RandomHorizontalFlip(),
+                T.ColorJitter(0.2, 0.2, 0.2),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+        
+        elif modality == 'audio':
+            return T.Compose([
+                AT.MelSpectrogram(sample_rate=config.get('sample_rate', 16000)),
+                AT.TimeMasking(time_mask_param=config.get('time_mask', 20)),
+                AT.FrequencyMasking(freq_mask_param=config.get('freq_mask', 5)),
+                AT.AmplitudeToDB()
+            ])
+        
+        else:
+            return get_default_transforms(modality, config)
+
+import torch
+import json
+import yaml
+from pathlib import Path
+from typing import Dict, Any, Optional
+import logging
+import zipfile
+import shutil
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+class ModelSerializer:
+    """Comprehensive model serialization and deserialization"""
+    
+    def __init__(self, model: torch.nn.Module, config: Dict[str, Any]):
+        self.model = model
+        self.config = config
+        self.serialization_version = "1.0.0"
+    
+    def save_model(self, path: str, include_optimizer: bool = False, 
+                  optimizer: Optional[torch.optim.Optimizer] = None,
+                  metadata: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Save model with comprehensive metadata and configuration
+        
+        Args:
+            path: Path to save the model
+            include_optimizer: Whether to save optimizer state
+            optimizer: Optimizer instance to save
+            metadata: Additional metadata to include
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Prepare save data
+        save_data = {
+            'model_state_dict': self.model.state_dict(),
+            'config': self.config,
+            'serialization_version': self.serialization_version,
+            'timestamp': datetime.now().isoformat(),
+            'metadata': metadata or {},
+            'model_architecture': str(self.model)
+        }
+        
+        if include_optimizer and optimizer:
+            save_data['optimizer_state_dict'] = optimizer.state_dict()
+        
+        # Save with error handling
+        try:
+            if path.suffix == '.pt':
+                torch.save(save_data, path)
+            elif path.suffix == '.zip':
+                self._save_as_zip(save_data, path)
+            else:
+                raise ValueError(f"Unsupported file format: {path.suffix}")
+            
+            logger.info(f"Model successfully saved to {path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save model to {path}: {e}")
+            raise
+    
+    def _save_as_zip(self, save_data: Dict[str, Any], path: Path) -> None:
+        """Save model as zip archive with multiple files"""
+        temp_dir = path.parent / f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        temp_dir.mkdir(exist_ok=True)
+        
+        try:
+            # Save model weights
+            torch.save(save_data['model_state_dict'], temp_dir / 'model_weights.pt')
+            
+            # Save configuration
+            with open(temp_dir / 'config.yaml', 'w') as f:
+                yaml.dump(save_data['config'], f)
+            
+            # Save metadata
+            with open(temp_dir / 'metadata.json', 'w') as f:
+                json.dump({
+                    'serialization_version': save_data['serialization_version'],
+                    'timestamp': save_data['timestamp'],
+                    'model_architecture': save_data['model_architecture'],
+                    **save_data['metadata']
+                }, f, indent=2)
+            
+            # Create zip archive
+            with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for file in temp_dir.iterdir():
+                    zipf.write(file, file.name)
+                    
+        finally:
+            # Cleanup temporary directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    @classmethod
+    def load_model(cls, path: str, model_class: Optional[torch.nn.Module] = None, 
+                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu') -> Dict[str, Any]:
+        """
+        Load model with comprehensive error handling and validation
+        
+        Args:
+            path: Path to load the model from
+            model_class: Model class instance for loading
+            device: Device to load the model onto
+        
+        Returns:
+            Dictionary containing model, config, and metadata
+        """
+        path = Path(path)
+        
+        if not path.exists():
+            raise FileNotFoundError(f"Model file not found: {path}")
+        
+        try:
+            if path.suffix == '.zip':
+                load_data = cls._load_from_zip(path, device)
+            else:
+                load_data = torch.load(path, map_location=device, weights_only=True)
+            
+            # Validate loaded data
+            cls._validate_load_data(load_data)
+            
+            # Reconstruct model if class provided
+            model = None
+            if model_class:
+                model = model_class(load_data['config'])
+                model.load_state_dict(load_data['model_state_dict'])
+                model.to(device)
+                model.eval()
+            
+            return {
+                'model': model,
+                'config': load_data['config'],
+                'metadata': load_data.get('metadata', {}),
+                'optimizer_state_dict': load_data.get('optimizer_state_dict'),
+                'version': load_data.get('serialization_version', 'unknown')
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to load model from {path}: {e}")
+            raise
+    
+    @classmethod
+    def _load_from_zip(cls, path: Path, device: str) -> Dict[str, Any]:
+        """Load model from zip archive"""
+        temp_dir = path.parent / f"extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        temp_dir.mkdir(exist_ok=True)
+        
+        try:
+            # Extract zip file
+            with zipfile.ZipFile(path, 'r') as zipf:
+                zipf.extractall(temp_dir)
+            
+            # Load components
+            load_data = {}
+            
+            # Load model weights
+            model_path = temp_dir / 'model_weights.pt'
+            if model_path.exists():
+                load_data['model_state_dict'] = torch.load(model_path, map_location=device, weights_only=True)
+            
+            # Load config
+            config_path = temp_dir / 'config.yaml'
+            if config_path.exists():
+                with open(config_path, 'r') as f:
+                    load_data['config'] = yaml.safe_load(f)
+            
+            # Load metadata
+            metadata_path = temp_dir / 'metadata.json'
+            if metadata_path.exists():
+                with open(metadata_path, 'r') as f:
+                    load_data['metadata'] = json.load(f)
+                    load_data['serialization_version'] = load_data['metadata'].get('serialization_version')
+            
+            return load_data
+            
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    @staticmethod
+    def _validate_load_data(load_data: Dict[str, Any]) -> None:
+        """Validate loaded model data"""
+        required_keys = ['model_state_dict', 'config']
+        for key in required_keys:
+            if key not in load_data:
+                raise ValueError(f"Missing required key in loaded data: {key}")
+        
+        # Check model state dict structure
+        if not isinstance(load_data['model_state_dict'], dict):
+            raise ValueError("Invalid model state dictionary")
+        
+        # Check config structure
+        if not isinstance(load_data['config'], dict):
+            raise ValueError("Invalid configuration format")
+
+class ModelVersionManager:
+    """Manage multiple versions of trained models"""
+    
+    def __init__(self, base_dir: str):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+    
+    def save_version(self, model: torch.nn.Module, config: Dict[str, Any], 
+                    metrics: Dict[str, float], version_name: Optional[str] = None) -> str:
+        """Save a new version of the model"""
+        if version_name is None:
+            version_name = f"v{len(self.list_versions()) + 1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        version_dir = self.base_dir / version_name
+        version_dir.mkdir(exist_ok=True)
+        
+        # Save model
+        serializer = ModelSerializer(model, config)
+        model_path = version_dir / 'model.zip'
+        
+        metadata = {
+            'metrics': metrics,
+            'version_name': version_name,
+            'save_timestamp': datetime.now().isoformat()
+        }
+        
+        serializer.save_model(model_path, metadata=metadata)
+        
+        # Save metrics separately
+        with open(version_dir / 'metrics.json', 'w') as f:
+            json.dump(metrics, f, indent=2)
+        
+        return str(version_dir)
+    
+    def list_versions(self) -> List[Dict[str, Any]]:
+        """List all saved model versions"""
+        versions = []
+        for version_dir in self.base_dir.iterdir():
+            if version_dir.is_dir():
+                metrics_file = version_dir / 'metrics.json'
+                metrics = {}
+                if metrics_file.exists():
+                    with open(metrics_file, 'r') as f:
+                        metrics = json.load(f)
+                
+                versions.append({
+                    'name': version_dir.name,
+                    'path': str(version_dir),
+                    'metrics': metrics,
+                    'model_path': str(version_dir / 'model.zip')
+                })
+        
+        return sorted(versions, key=lambda x: x['name'])
+    
+    def load_version(self, version_name: str, model_class: torch.nn.Module) -> Dict[str, Any]:
+        """Load a specific model version"""
+        version_dir = self.base_dir / version_name
+        if not version_dir.exists():
+            raise ValueError(f"Version {version_name} not found")
+        
+        model_path = version_dir / 'model.zip'
+        return ModelSerializer.load_model(model_path, model_class)
+
+import wandb
+import numpy as np
+from datetime import datetime
+import time
+import torch
+from typing import Dict, List, Optional
+import logging
+import json
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+class AdvancedTrainingMonitor:
+    """Comprehensive training monitoring with multiple backends"""
+    
+    def __init__(self, config: Dict, experiment_name: Optional[str] = None):
+        self.config = config
+        self.experiment_name = experiment_name or f"aegis_exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        self.metrics_history = {
+            'train': {}, 'val': {}, 'test': {},
+            'system': {}, 'timing': {}
+        }
+        
+        self._initialize_backends()
+        self.start_time = time.time()
+    
+    def _initialize_backends(self):
+        """Initialize monitoring backends based on config"""
+        self.backends = []
+        
+        # WandB backend
+        if self.config.get('use_wandb', False):
+            try:
+                wandb.init(
+                    project=self.config.get('wandb_project', 'aegis'),
+                    name=self.experiment_name,
+                    config=self.config
+                )
+                self.backends.append('wandb')
+                logger.info("Initialized Weights & Biases monitoring")
+            except Exception as e:
+                logger.warning(f"Failed to initialize WandB: {e}")
+        
+        # TensorBoard backend (you can add similar initialization)
+        if self.config.get('use_tensorboard', False):
+            self.backends.append('tensorboard')
+            logger.info("TensorBoard monitoring enabled")
+    
+    def log_metrics(self, metrics: Dict[str, float], step: int, phase: str = 'train'):
+        """Log metrics to all enabled backends"""
+        # Store in history
+        if phase not in self.metrics_history:
+            self.metrics_history[phase] = {}
+        
+        for key, value in metrics.items():
+            if key not in self.metrics_history[phase]:
+                self.metrics_history[phase][key] = []
+            self.metrics_history[phase][key].append((step, value))
+        
+        # Log to backends
+        if 'wandb' in self.backends:
+            wandb_metrics = {f"{phase}/{key}": value for key, value in metrics.items()}
+            wandb_metrics['step'] = step
+            wandb.log(wandb_metrics)
+        
+        # Add timing information
+        if phase == 'train' and step % self.config.get('log_interval', 100) == 0:
+            self.log_system_metrics(step)
+    
+    def log_system_metrics(self, step: int):
+        """Log system performance metrics"""
+        system_metrics = {
+            'memory_allocated_mb': torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0,
+            'memory_cached_mb': torch.cuda.memory_cached() / 1024**2 if torch.cuda.is_available() else 0,
+            'gpu_utilization': self._get_gpu_utilization(),
+            'epoch_time': time.time() - self.start_time
+        }
+        
+        self.metrics_history['system'][step] = system_metrics
+        
+        if 'wandb' in self.backends:
+            wandb_metrics = {f"system/{k}": v for k, v in system_metrics.items()}
+            wandb_metrics['step'] = step
+            wandb.log(wandb_metrics)
+    
+    def _get_gpu_utilization(self) -> float:
+        """Get GPU utilization percentage"""
+        try:
+            if torch.cuda.is_available():
+                # This is a placeholder - actual implementation may vary by system
+                return torch.cuda.utilization() if hasattr(torch.cuda, 'utilization') else 0.0
+        except:
+            return 0.0
+        return 0.0
+    
+    def log_model_weights(self, model: torch.nn.Module, step: int):
+        """Log model weights and gradients"""
+        if 'wandb' in self.backends and step % self.config.get('weight_log_interval', 1000) == 0:
+            try:
+                # Log weight histograms
+                for name, param in model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        wandb.log({
+                            f"weights/{name}": wandb.Histogram(param.data.cpu().numpy()),
+                            f"gradients/{name}": wandb.Histogram(param.grad.cpu().numpy())
+                        }, step=step)
+            except Exception as e:
+                logger.warning(f"Failed to log model weights: {e}")
+    
+    def log_learning_rates(self, optimizer: torch.optim.Optimizer, step: int):
+        """Log current learning rates"""
+        lrs = {}
+        for i, param_group in enumerate(optimizer.param_groups):
+            lrs[f'lr_group_{i}'] = param_group['lr']
+        
+        self.log_metrics(lrs, step, 'training')
+    
+    def create_training_report(self) -> Dict[str, Any]:
+        """Generate comprehensive training report"""
+        report = {
+            'experiment_name': self.experiment_name,
+            'config': self.config,
+            'start_time': self.start_time,
+            'end_time': time.time(),
+            'duration_seconds': time.time() - self.start_time,
+            'final_metrics': {},
+            'system_metrics': self.metrics_history['system'],
+            'summary': {}
+        }
+        
+        # Add final metrics for each phase
+        for phase in ['train', 'val', 'test']:
+            if self.metrics_history[phase]:
+                report['final_metrics'][phase] = {
+                    metric: values[-1][1] if values else None
+                    for metric, values in self.metrics_history[phase].items()
+                }
+        
+        # Generate summary statistics
+        report['summary'] = self._generate_summary()
+        
+        # Save report to file
+        report_path = Path(f"reports/{self.experiment_name}_report.json")
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        return report
+    
+    def _generate_summary(self) -> Dict[str, Any]:
+        """Generate summary statistics from metrics"""
+        summary = {}
+        
+        for phase in ['train', 'val']:
+            if self.metrics_history[phase]:
+                phase_metrics = {}
+                for metric, values in self.metrics_history[phase].items():
+                    if values:
+                        metric_values = [v[1] for v in values]
+                        phase_metrics[metric] = {
+                            'final': metric_values[-1],
+                            'best': min(metric_values) if 'loss' in metric else max(metric_values),
+                            'mean': np.mean(metric_values),
+                            'std': np.std(metric_values)
+                        }
+                summary[phase] = phase_metrics
+        
+        return summary
+    
+    def alert_on_anomalies(self, metrics: Dict[str, float], phase: str = 'train'):
+        """Detect and alert on anomalous metrics"""
+        anomalies = []
+        
+        for metric, value in metrics.items():
+            if metric in self.metrics_history[phase]:
+                history = [v[1] for v in self.metrics_history[phase][metric][-10:]]  # Last 10 values
+                if history:
+                    mean = np.mean(history)
+                    std = np.std(history)
+                    
+                    # Detect significant deviations
+                    if std > 0 and abs(value - mean) > 3 * std:
+                        anomalies.append({
+                            'metric': metric,
+                            'value': value,
+                            'expected_range': f"{mean - 2*std:.3f} - {mean + 2*std:.3f}",
+                            'deviation': (value - mean) / std
+                        })
+        
+        if anomalies:
+            logger.warning(f"Detected metric anomalies: {anomalies}")
+            if 'wandb' in self.backends:
+                wandb.alert(
+                    title="Training Anomaly Detected",
+                    text=f"Anomalies in {phase} metrics: {anomalies}"
+                )
+        
+        return anomalies
+
+class MemoryProfiler:
+    """Advanced memory profiling and optimization"""
+    
+    def __init__(self):
+        self.memory_stats = []
+    
+    def profile_memory(self, description: str = ""):
+        """Record current memory usage"""
+        if torch.cuda.is_available():
+            stats = {
+                'timestamp': time.time(),
+                'description': description,
+                'allocated_mb': torch.cuda.memory_allocated() / 1024**2,
+                'cached_mb': torch.cuda.memory_cached() / 1024**2,
+                'max_allocated_mb': torch.cuda.max_memory_allocated() / 1024**2,
+                'memory_usage_percentage': (torch.cuda.memory_allocated() / 
+                                           torch.cuda.max_memory_allocated() * 100)
+            }
+            self.memory_stats.append(stats)
+            return stats
+        return {}
+    
+    def generate_memory_report(self) -> Dict[str, Any]:
+        """Generate comprehensive memory usage report"""
+        if not self.memory_stats:
+            return {}
+        
+        return {
+            'peak_memory_mb': max(stats['allocated_mb'] for stats in self.memory_stats),
+            'average_memory_mb': np.mean([stats['allocated_mb'] for stats in self.memory_stats]),
+            'memory_timeline': self.memory_stats,
+            'recommendations': self._generate_memory_recommendations()
+        }
+    
+    def _generate_memory_recommendations(self) -> List[str]:
+        """Generate memory optimization recommendations"""
+        recommendations = []
+        peak_memory = max(stats['allocated_mb'] for stats in self.memory_stats)
+        
+        if peak_memory > 8000:  # 8GB threshold
+            recommendations.append("Consider using gradient checkpointing")
+            recommendations.append("Reduce batch size or use gradient accumulation")
+            recommendations.append("Use mixed precision training")
+        
+        if any(stats['memory_usage_percentage'] > 90 for stats in self.memory_stats):
+            recommendations.append("High GPU memory usage detected - consider model optimization")
+        
+        return recommendations
+
+import torch
+import numpy as np
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import confusion_matrix, classification_report
+from typing import Dict, List, Optional, Union
+import logging
+import json
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+class ComprehensiveEvaluator:
+    """Comprehensive model evaluation with multiple metrics and visualizations"""
+    
+    def __init__(self, model: torch.nn.Module, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+        self.model = model
+        self.device = device
+        self.model.to(device)
+        self.model.eval()
+    
+    def evaluate(self, dataloader, tasks: Optional[List[str]] = None) -> Dict[str, Dict[str, float]]:
+        """
+        Comprehensive evaluation on a dataloader
+        
+        Args:
+            dataloader: DataLoader for evaluation
+            tasks: List of tasks to evaluate (None for all)
+        
+        Returns:
+            Dictionary of metrics for each task
+        """
+        results = {task: {'preds': [], 'targets': []} for task in (tasks or [])}
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                # Move batch to device
+                device_batch = {
+                    'inputs': {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                              for k, v in batch['inputs'].items()},
+                    'labels': {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                              for k, v in batch.get('labels', {}).items()}
+                }
+                
+                # Get predictions
+                outputs, _ = self.model(device_batch['inputs'], tasks=tasks)
+                
+                # Collect predictions and targets
+                for task, output in outputs.items():
+                    if task in results:
+                        preds = torch.argmax(output, dim=1).cpu().numpy()
+                        results[task]['preds'].extend(preds)
+                        
+                        if task in device_batch['labels']:
+                            targets = device_batch['labels'][task].cpu().numpy()
+                            results[task]['targets'].extend(targets)
+        
+        # Calculate metrics for each task
+        metrics = {}
+        for task, data in results.items():
+            if data['preds'] and data['targets'] and len(data['preds']) == len(data['targets']):
+                metrics[task] = self._calculate_task_metrics(data['preds'], data['targets'])
+            else:
+                logger.warning(f"No valid data for task {task}")
+                metrics[task] = {}
+        
+        return metrics
+    
+    def _calculate_task_metrics(self, preds: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
+        """Calculate comprehensive metrics for a task"""
+        try:
+            return {
+                'accuracy': accuracy_score(targets, preds),
+                'f1_score': f1_score(targets, preds, average='weighted'),
+                'f1_macro': f1_score(targets, preds, average='macro'),
+                'f1_micro': f1_score(targets, preds, average='micro'),
+                'precision': precision_score(targets, preds, average='weighted'),
+                'recall': recall_score(targets, preds, average='weighted'),
+                'confusion_matrix': confusion_matrix(targets, preds).tolist(),
+                'class_report': classification_report(targets, preds, output_dict=True)
+            }
+        except Exception as e:
+            logger.error(f"Error calculating metrics: {e}")
+            return {}
+    
+    def evaluate_per_modality(self, dataloader, tasks: Optional[List[str]] = None) -> Dict[str, Dict]:
+        """Evaluate model performance with different modality combinations"""
+        modality_combinations = [
+            ['text'], ['image'], ['audio'],
+            ['text', 'image'], ['text', 'audio'], ['image', 'audio'],
+            ['text', 'image', 'audio']
+        ]
+        
+        results = {}
+        
+        for modalities in modality_combinations:
+            logger.info(f"Evaluating with modalities: {modalities}")
+            
+            # Create modified dataloader with only these modalities
+            modality_dataloader = self._create_modality_dataloader(dataloader, modalities)
+            
+            # Evaluate
+            metrics = self.evaluate(modality_dataloader, tasks)
+            results['_'.join(modalities)] = metrics
+        
+        return results
+    
+    def _create_modality_dataloader(self, original_datal
+
+import logging
+import functools
+import time
+from typing import Dict, Any, Callable, Optional, Type, Union
+import traceback
+import sys
+from pathlib import Path
+import json
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class AegisError(Exception):
+    """Base exception class for Aegis framework"""
+    def __init__(self, message: str, error_code: str = "AEGIS_ERROR", details: Optional[Dict] = None):
+        self.message = message
+        self.error_code = error_code
+        self.details = details or {}
+        super().__init__(self.message)
+
+class ModelLoadingError(AegisError):
+    """Exception raised for model loading failures"""
+    pass
+
+class DataLoadingError(AegisError):
+    """Exception raised for data loading failures"""
+    pass
+
+class TrainingError(AegisError):
+    """Exception raised for training failures"""
+    pass
+
+class ValidationError(AegisError):
+    """Exception raised for validation failures"""
+    pass
+
+class InferenceError(AegisError):
+    """Exception raised for inference failures"""
+    pass
+
+class ConfigurationError(AegisError):
+    """Exception raised for configuration errors"""
+    pass
+
+class ErrorHandler:
+    """Comprehensive error handling and recovery system"""
+    
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialize()
+        return cls._instance
+    
+    def _initialize(self):
+        self.error_log = []
+        self.error_counts = {}
+        self.recovery_strategies = {}
+        self.max_retries = 3
+        self.circuit_breakers = {}
+        
+    def handle_error(self, error: Exception, context: str = "", 
+                    severity: str = "ERROR", **kwargs) -> Dict[str, Any]:
+        """
+        Handle an error with comprehensive logging and recovery
+        
+        Args:
+            error: The exception to handle
+            context: Context where error occurred
+            severity: Error severity level
+            **kwargs: Additional context information
+        
+        Returns:
+            Dictionary with error handling results
+        """
+        error_info = {
+            'timestamp': datetime.now().isoformat(),
+            'error_type': type(error).__name__,
+            'error_message': str(error),
+            'context': context,
+            'severity': severity,
+            'traceback': traceback.format_exc(),
+            'additional_info': kwargs
+        }
+        
+        # Log the error
+        self._log_error(error_info)
+        
+        # Update error counts for circuit breaking
+        self._update_error_counts(context, error_info)
+        
+        # Attempt recovery if strategy exists
+        recovery_result = self._attempt_recovery(error, context, error_info)
+        
+        # Check if circuit breaker should be triggered
+        circuit_status = self._check_circuit_breaker(context)
+        
+        return {
+            'error_info': error_info,
+            'recovery_result': recovery_result,
+            'circuit_breaker_status': circuit_status,
+            'should_retry': recovery_result.get('should_retry', False)
+        }
+    
+    def _log_error(self, error_info: Dict[str, Any]):
+        """Log error to appropriate channels"""
+        log_message = f"{error_info['context']} - {error_info['error_type']}: {error_info['error_message']}"
+        
+        # Choose logging level based on severity
+        if error_info['severity'] == 'CRITICAL':
+            logger.critical(log_message, extra=error_info)
+        elif error_info['severity'] == 'ERROR':
+            logger.error(log_message, extra=error_info)
+        elif error_info['severity'] == 'WARNING':
+            logger.warning(log_message, extra=error_info)
+        else:
+            logger.info(log_message, extra=error_info)
+        
+        # Store in error log
+        self.error_log.append(error_info)
+        
+        # Write to error file if configured
+        self._write_to_error_file(error_info)
+    
+    def _write_to_error_file(self, error_info: Dict[str, Any]):
+        """Write error to error log file"""
+        try:
+            error_dir = Path("logs/errors")
+            error_dir.mkdir(parents=True, exist_ok=True)
+            
+            error_file = error_dir / f"errors_{datetime.now().strftime('%Y%m%d')}.jsonl"
+            
+            with open(error_file, 'a') as f:
+                f.write(json.dumps(error_info) + '\n')
+                
+        except Exception as e:
+            logger.warning(f"Failed to write to error file: {e}")
+    
+    def _update_error_counts(self, context: str, error_info: Dict[str, Any]):
+        """Update error counts for circuit breaking"""
+        if context not in self.error_counts:
+            self.error_counts[context] = {
+                'total_errors': 0,
+                'recent_errors': [],
+                'last_error_time': None
+            }
+        
+        self.error_counts[context]['total_errors'] += 1
+        self.error_counts[context]['recent_errors'].append({
+            'time': error_info['timestamp'],
+            'type': error_info['error_type'],
+            'severity': error_info['severity']
+        })
+        self.error_counts[context]['last_error_time'] = error_info['timestamp']
+        
+        # Keep only recent errors (last hour)
+        current_time = datetime.now()
+        self.error_counts[context]['recent_errors'] = [
+            err for err in self.error_counts[context]['recent_errors']
+            if (current_time - datetime.fromisoformat(err['time'])).total_seconds() < 3600
+        ]
+    
+    def _check_circuit_breaker(self, context: str) -> Dict[str, Any]:
+        """Check if circuit breaker should be triggered"""
+        if context not in self.error_counts:
+            return {'status': 'CLOSED', 'reason': 'No errors'}
+        
+        recent_errors = self.error_counts[context]['recent_errors']
+        
+        # Circuit breaker logic
+        critical_errors = sum(1 for err in recent_errors if err['severity'] == 'CRITICAL')
+        total_recent_errors = len(recent_errors)
+        
+        if critical_errors >= 5 or total_recent_errors >= 20:
+            # Trip circuit breaker
+            if context not in self.circuit_breakers:
+                self.circuit_breakers[context] = {
+                    'tripped_time': datetime.now().isoformat(),
+                    'reason': 'Too many errors',
+                    'error_count': total_recent_errors
+                }
+            return {'status': 'OPEN', 'reason': 'Circuit breaker tripped'}
+        
+        return {'status': 'CLOSED', 'reason': 'Normal operation'}
+    
+    def register_recovery_strategy(self, error_type: Type[Exception], 
+                                 strategy: Callable, context: str = "global"):
+        """Register a recovery strategy for specific error types"""
+        if context not in self.recovery_strategies:
+            self.recovery_strategies[context] = {}
+        
+        self.recovery_strategies[context][error_type] = strategy
+    
+    def _attempt_recovery(self, error: Exception, context: str, 
+                         error_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Attempt to recover from an error using registered strategies"""
+        recovery_strategies = self.recovery_strategies.get(context, {})
+        
+        for error_type, strategy in recovery_strategies.items():
+            if isinstance(error, error_type):
+                try:
+                    result = strategy(error, error_info)
+                    return {
+                        'success': True,
+                        'strategy_used': strategy.__name__,
+                        'result': result,
+                        'should_retry': result.get('should_retry', False)
+                    }
+                except Exception as recovery_error:
+                    return {
+                        'success': False,
+                        'strategy_used': strategy.__name__,
+                        'recovery_error': str(recovery_error),
+                        'should_retry': False
+                    }
+        
+        return {'success': False, 'strategy_used': None, 'should_retry': False}
+    
+    def get_error_stats(self) -> Dict[str, Any]:
+        """Get comprehensive error statistics"""
+        return {
+            'total_errors': len(self.error_log),
+            'error_counts_by_context': {ctx: data['total_errors'] 
+                                      for ctx, data in self.error_counts.items()},
+            'recent_errors_by_severity': self._get_recent_errors_by_severity(),
+            'circuit_breaker_status': {ctx: status 
+                                     for ctx, status in self.circuit_breakers.items()}
+        }
+    
+    def _get_recent_errors_by_severity(self) -> Dict[str, int]:
+        """Get count of recent errors by severity level"""
+        severities = ['CRITICAL', 'ERROR', 'WARNING', 'INFO']
+        result = {sev: 0 for sev in severities}
+        
+        for error in self.error_log[-1000:]:  # Last 1000 errors
+            if error['severity'] in result:
+                result[error['severity']] += 1
+        
+        return result
+    
+    def clear_errors(self, older_than_days: int = 30):
+        """Clear old errors from the log"""
+        cutoff_time = datetime.now().timestamp() - (older_than_days * 24 * 3600)
+        
+        self.error_log = [
+            error for error in self.error_log
+            if datetime.fromisoformat(error['timestamp']).timestamp() > cutoff_time
+        ]
+
+# Global error handler instance
+error_handler = ErrorHandler()
+
+def error_handler_decorator(context: str = "", severity: str = "ERROR", 
+                          max_retries: int = 3, retry_delay: float = 1.0):
+    """
+    Decorator for automatic error handling and retry logic
+    
+    Args:
+        context: Context for error reporting
+        severity: Default severity level
+        max_retries: Maximum number of retry attempts
+        retry_delay: Delay between retries in seconds
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                    
+                except Exception as e:
+                    last_error = e
+                    
+                    # Handle the error
+                    handling_result = error_handler.handle_error(
+                        e, context=context or func.__name__, 
+                        severity=severity, attempt=attempt, max_retries=max_retries,
+                        function_name=func.__name__, args=args, kwargs=kwargs
+                    )
+                    
+                    # Check if we should retry
+                    if attempt < max_retries and handling_result['should_retry']:
+                        time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                        continue
+                    
+                    # If not retrying or out of retries, re-raise
+                    if attempt == max_retries:
+                        raise
+                    
+            raise last_error  # Should never reach here
+        return wrapper
+    return decorator
+
+class CircuitBreaker:
+    """Circuit breaker pattern implementation"""
+    
+    def __init__(self, name: str, max_failures: int = 5, reset_timeout: int = 60):
+        self.name = name
+        self.max_failures = max_failures
+        self.reset_timeout = reset_timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+    
+    def execute(self, func: Callable, *args, **kwargs):
+        """Execute function with circuit breaker protection"""
+        if self.state == "OPEN":
+            # Check if reset timeout has passed
+            if (self.last_failure_time and 
+                (time.time() - self.last_failure_time) > self.reset_timeout):
+                self.state = "HALF_OPEN"
+            else:
+                raise AegisError(f"Circuit breaker OPEN for {self.name}", 
+                               "CIRCUIT_BREAKER_OPEN")
+        
+        try:
+            result = func(*args, **kwargs)
+            
+            # If successful and in HALF_OPEN state, reset circuit breaker
+            if self.state == "HALF_OPEN":
+                self.reset()
+                
+            return result
+            
+        except Exception as e:
+            self.record_failure()
+            raise e
+    
+    def record_failure(self):
+        """Record a failure and update circuit breaker state"""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        
+        if self.failure_count >= self.max_failures:
+            self.state = "OPEN"
+    
+    def reset(self):
+        """Reset the circuit breaker"""
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "CLOSED"
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get current circuit breaker status"""
+        return {
+            'name': self.name,
+            'state': self.state,
+            'failure_count': self.failure_count,
+            'last_failure_time': self.last_failure_time
+        }
+
+# Pre-defined recovery strategies
+def model_loading_recovery(error: Exception, error_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Recovery strategy for model loading errors"""
+    if "CUDA out of memory" in str(error):
+        return {
+            'action': 'Retry with CPU',
+            'should_retry': True,
+            'new_device': 'cpu'
+        }
+    elif "file not found" in str(error).lower():
+        return {
+            'action': 'Check alternative paths',
+            'should_retry': False,
+            'message': 'File not found error requires manual intervention'
+        }
+    
+    return {'should_retry': False}
+
+def data_loading_recovery(error: Exception, error_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Recovery strategy for data loading errors"""
+    if "corrupted" in str(error).lower():
+        return {
+            'action': 'Skip corrupted sample',
+            'should_retry': True,
+            'skip_sample': True
+        }
+    elif "memory" in str(error).lower():
+        return {
+            'action': 'Reduce batch size and retry',
+            'should_retry': True,
+            'reduce_batch_size': True
+        }
+    
+    return {'should_retry': False}
+
+def training_recovery(error: Exception, error_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Recovery strategy for training errors"""
+    if "nan" in str(error).lower() or "inf" in str(error).lower():
+        return {
+            'action': 'Reduce learning rate and restart from checkpoint',
+            'should_retry': True,
+            'reduce_lr': True,
+            'load_checkpoint': True
+        }
+    elif "cuda" in str(error).lower() and "memory" in str(error).lower():
+        return {
+            'action': 'Reduce batch size and clear cache',
+            'should_retry': True,
+            'reduce_batch_size': True,
+            'clear_cache': True
+        }
+    
+    return {'should_retry': False}
+
+# Register default recovery strategies
+error_handler.register_recovery_strategy(ModelLoadingError, model_loading_recovery, "model_loading")
+error_handler.register_recovery_strategy(DataLoadingError, data_loading_recovery, "data_loading")
+error_handler.register_recovery_strategy(TrainingError, training_recovery, "training")
+
+# Utility functions for common error scenarios
+def validate_config(config: Dict[str, Any], required_keys: List[str]) -> None:
+    """Validate configuration dictionary"""
+    missing_keys = [key for key in required_keys if key not in config]
+    if missing_keys:
+        raise ConfigurationError(
+            f"Missing required configuration keys: {missing_keys}",
+            "MISSING_CONFIG_KEYS",
+            {'missing_keys': missing_keys, 'config_keys': list(config.keys())}
+        )
+
+def validate_model_output(output: Any, expected_shape: Optional[tuple] = None) -> None:
+    """Validate model output integrity"""
+    if output is None:
+        raise InferenceError("Model returned None output", "NULL_MODEL_OUTPUT")
+    
+    if isinstance(output, torch.Tensor):
+        if torch.isnan(output).any():
+            raise InferenceError("Model output contains NaN values", "NAN_OUTPUT")
+        
+        if torch.isinf(output).any():
+            raise InferenceError("Model output contains Inf values", "INF_OUTPUT")
+        
+        if expected_shape and output.shape != expected_shape:
+            raise InferenceError(
+                f"Output shape {output.shape} doesn't match expected {expected_shape}",
+                "SHAPE_MISMATCH",
+                {'actual_shape': output.shape, 'expected_shape': expected_shape}
+            )
+
+def safe_model_load(model_path: str, model_class: Any, device: str = 'cpu') -> Any:
+    """Safely load a model with comprehensive error handling"""
+    try:
+        model = model_class()
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.to(device)
+        model.eval()
+        return model
+        
+    except FileNotFoundError as e:
+        raise ModelLoadingError(
+            f"Model file not found: {model_path}",
+            "FILE_NOT_FOUND",
+            {'model_path': model_path, 'error': str(e)}
+        ) from e
+        
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            # Try loading on CPU instead
+            try:
+                logger.warning("CUDA OOM, trying CPU...")
+                return safe_model_load(model_path, model_class, 'cpu')
+            except Exception as cpu_error:
+                raise ModelLoadingError(
+                    "Failed to load model on both GPU and CPU",
+                    "LOAD_FAILURE",
+                    {'gpu_error': str(e), 'cpu_error': str(cpu_error)}
+                ) from cpu_error
+        else:
+            raise ModelLoadingError(
+                f"Runtime error loading model: {e}",
+                "RUNTIME_ERROR",
+                {'error': str(e)}
+            ) from e
+            
+    except Exception as e:
+        raise ModelLoadingError(
+            f"Unexpected error loading model: {e}",
+            "UNEXPECTED_ERROR",
+            {'error': str(e), 'model_path': model_path}
+        ) from e
+
+# Context managers for safe execution
+class SafeExecutionContext:
+    """Context manager for safe execution with error handling"""
+    
+    def __init__(self, context: str = "", severity: str = "ERROR"):
+        self.context = context
+        self.severity = severity
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_val is not None:
+            error_handler.handle_error(
+                exc_val, context=self.context, severity=self.severity
+            )
+            return False  # Don't suppress the exception
+        return True
+
+# Example usage decorator
+@error_handler_decorator(context="model_training", severity="ERROR", max_retries=3)
+def safe_train_model(model, dataloader, optimizer):
+    """Example of decorated function with automatic error handling"""
+    # Training logic here
+    pass
+
+import torch
+import numpy as np
+from typing import Dict, Any, List, Optional
+from .error_handling import ValidationError, error_handler
+
+class DataValidator:
+    """Comprehensive data validation utilities"""
+    
+    @staticmethod
+    def validate_data_batch(batch: Dict[str, Any], expected_modalities: List[str]) -> None:
+        """Validate a data batch for training/inference"""
+        if 'inputs' not in batch:
+            raise ValidationError("Batch missing 'inputs' key", "MISSING_INPUTS_KEY")
+        
+        # Check for required modalities
+        for modality in expected_modalities:
+            if modality not in batch['inputs']:
+                raise ValidationError(
+                    f"Missing required modality: {modality}",
+                    "MISSING_MODALITY",
+                    {'expected_modalities': expected_modalities, 'actual_modalities': list(batch['inputs'].keys())}
+                )
+        
+        # Validate each modality
+        for modality, data in batch['inputs'].items():
+            DataValidator._validate_modality(data, modality)
+        
+        # Validate labels if present
+        if 'labels' in batch:
+            for task, labels in batch['labels'].items():
+                DataValidator._validate_labels(labels, task)
+    
+    @staticmethod
+    def _validate_modality(data: Any, modality: str) -> None:
+        """Validate data for a specific modality"""
+        if data is None:
+            raise ValidationError(f"None data for modality: {modality}", "NULL_MODALITY_DATA")
+        
+        if isinstance(data, torch.Tensor):
+            if torch.isnan(data).any():
+                raise ValidationError(f"NaN values in {modality} data", "NAN_DATA")
+            
+            if torch.isinf(data).any():
+                raise ValidationError(f"Inf values in {modality} data", "INF_DATA")
+            
+            if data.numel() == 0:
+                raise ValidationError(f"Empty tensor for modality: {modality}", "EMPTY_TENSOR")
+        
+        elif isinstance(data, list):
+            if len(data) == 0:
+                raise ValidationError(f"Empty list for modality: {modality}", "EMPTY_LIST")
+    
+    @staticmethod
+    def _validate_labels(labels: Any, task: str) -> None:
+        """Validate label data"""
+        if labels is None:
+            raise ValidationError(f"None labels for task: {task}", "NULL_LABELS")
+        
+        if isinstance(labels, torch.Tensor):
+            if labels.dim() == 0:
+                raise ValidationError(f"Scalar labels for task: {task}", "SCALAR_LABELS")
+            
+            unique_labels = torch.unique(labels)
+            if len(unique_labels) == 1:
+                raise ValidationError(f"Single class in labels for task: {task}", "SINGLE_CLASS")
+
+class ModelOutputValidator:
+    """Validation utilities for model outputs"""
+    
+    @staticmethod
+    def validate_outputs(outputs: Dict[str, Any], expected_tasks: List[str]) -> None:
+        """Validate model outputs"""
+        if not outputs:
+            raise ValidationError("Empty model outputs", "EMPTY_OUTPUTS")
+        
+        for task, output in outputs.items():
+            if task not in expected_tasks:
+                raise ValidationError(
+                    f"Unexpected task in outputs: {task}",
+                    "UNEXPECTED_TASK",
+                    {'expected_tasks': expected_tasks, 'actual_tasks': list(outputs.keys())}
+                )
+            
+            ModelOutputValidator._validate_single_output(output, task)
+    
+    @staticmethod
+    def _validate_single_output(output: Any, task: str) -> None:
+        """Validate a single model output"""
+        if output is None:
+            raise ValidationError(f"None output for task: {task}", "NULL_OUTPUT")
+        
+        if isinstance(output, torch.Tensor):
+            if torch.isnan(output).any():
+                raise ValidationError(f"NaN values in output for task: {task}", "NAN_OUTPUT")
+            
+            if torch.isinf(output).any():
+                raise ValidationError(f"Inf values in output for task: {task}", "INF_OUTPUT")
+            
+            if output.requires_grad:
+                raise ValidationError(f"Output with gradients for task: {task}", "OUTPUT_WITH_GRADIENTS")
+
+class ConfigurationValidator:
+    """Validation utilities for configuration"""
+    
+    @staticmethod
+    def validate_training_config(config: Dict[str, Any]) -> None:
+        """Validate training configuration"""
+        required_keys = ['batch_size', 'learning_rate', 'num_epochs']
+        missing_keys = [key for key in required_keys if key not in config]
+        
+        if missing_keys:
+            raise ValidationError(
+                f"Missing required training config keys: {missing_keys}",
+                "MISSING_TRAINING_CONFIG",
+                {'missing_keys': missing_keys}
+            )
+        
+        # Validate values
+        if config['batch_size'] <= 0:
+            raise ValidationError("Batch size must be positive", "INVALID_BATCH_SIZE")
+        
+        if config['learning_rate'] <= 0:
+            raise ValidationError("Learning rate must be positive", "INVALID_LEARNING_RATE")
+        
+        if config['num_epochs'] <= 0:
+            raise ValidationError("Number of epochs must be positive", "INVALID_EPOCHS")
+    
+    @staticmethod
+    def validate_model_config(config: Dict[str, Any]) -> None:
+        """Validate model configuration"""
+        if 'encoders' not in config:
+            raise ValidationError("Missing encoders configuration", "MISSING_ENCODERS_CONFIG")
+        
+        for modality, encoder_config in config['encoders'].items():
+            if 'model_name' not in encoder_config:
+                raise ValidationError(
+                    f"Missing model_name for {modality} encoder",
+                    "MISSING_MODEL_NAME",
+                    {'modality': modality}
+                )
+
+import time
+import logging
+from typing import Callable, Optional, Type, List
+from functools import wraps
+from .error_handling import error_handler, AegisError
+
+logger = logging.getLogger(__name__)
+
+class RetryManager:
+    """Advanced retry mechanism with exponential backoff and circuit breaking"""
+    
+    def __init__(self, max_retries: int = 3, base_delay: float = 1.0, 
+                 max_delay: float = 30.0, retryable_errors: Optional[List[Type[Exception]]] = None):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.retryable_errors = retryable_errors or [Exception]
+    
+    def execute_with_retry(self, func: Callable, *args, **kwargs) -> Any:
+        """Execute function with retry logic"""
+        last_exception = None
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+                
+            except Exception as e:
+                last_exception = e
+                
+                # Check if this error type is retryable
+                if not any(isinstance(e, error_type) for error_type in self.retryable_errors):
+                    raise
+                
+                # Handle the error
+                error_handler.handle_error(
+                    e, 
+                    context=f"retry_attempt_{attempt}", 
+                    severity="WARNING",
+                    attempt=attempt,
+                    max_retries=self.max_retries,
+                    function_name=func.__name__
+                )
+                
+                # Check if we should give up
+                if attempt >= self.max_retries:
+                    break
+                
+                # Calculate delay with exponential backoff and jitter
+                delay = min(self.base_delay * (2 ** attempt), self.max_delay)
+                jitter = delay * 0.1  # 10% jitter
+                actual_delay = delay + (np.random.random() * jitter)
+                
+                logger.warning(f"Attempt {attempt + 1}/{self.max_retries} failed. "
+                             f"Retrying in {actual_delay:.2f}s...")
+                
+                time.sleep(actual_delay)
+        
+        # If we get here, all retries failed
+        raise AegisError(
+            f"All {self.max_retries} retry attempts failed for {func.__name__}",
+            "ALL_RETRIES_FAILED",
+            {'function': func.__name__, 'last_error': str(last_exception)}
+        ) from last_exception
+
+def retryable(max_retries: int = 3, base_delay: float = 1.0, 
+             retryable_errors: Optional[List[Type[Exception]]] = None):
+    """Decorator for making functions retryable"""
+    retry_manager = RetryManager(max_retries, base_delay, retryable_errors=retryable_errors)
+    
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            return retry_manager.execute_with_retry(func, *args, **kwargs)
+        return wrapper
+    return decorator
+
+# Example usage
+@retryable(max_retries=5, base_delay=2.0, retryable_errors=[ConnectionError, TimeoutError])
+def fetch_remote_data(url: str):
+    """Example retryable function for remote data fetching"""
+    # Implementation here
+    pass
+
+🎯 Integration Example
+
+# In your training script
+from aegis.utils.error_handling import error_handler_decorator, SafeExecutionContext
+from aegis.utils.validation import DataValidator
+
+@error_handler_decorator(context="model_training", severity="ERROR", max_retries=3)
+def train_epoch(model, dataloader, optimizer):
+    model.train()
+    
+    for batch_idx, batch in enumerate(dataloader):
+        try:
+            # Validate batch before processing
+            DataValidator.validate_data_batch(batch, ['text', 'image'])
+            
+            with SafeExecutionContext(context="batch_processing", severity="WARNING"):
+                # Your training logic here
+                outputs = model(batch['inputs'])
+                loss = compute_loss(outputs, batch['labels'])
+                
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                
+        except Exception as e:
+            # This will be caught by the decorator
+            raise
+
+# In your main function
+def main():
+    try:
+        # Your main logic here
+        train_epoch(model, train_loader, optimizer)
+        
+    except Exception as e:
+        # Global error handling
+        error_info = error_handler.handle_error(e, context="main_execution", severity="CRITICAL")
+        
+        if error_info['circuit_breaker_status']['status'] == 'OPEN':
+            logger.critical("Circuit breaker tripped - stopping execution")
+            return
+        
+        # Check if we should retry based on error handling result
+        if error_info['recovery_result']['should_retry']:
+            logger.info("Retrying after recovery...")
+            # Implement retry logic
