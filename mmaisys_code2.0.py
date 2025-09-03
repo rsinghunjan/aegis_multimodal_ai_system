@@ -5477,3 +5477,270 @@ def main():
         if error_info['recovery_result']['should_retry']:
             logger.info("Retrying after recovery...")
             # Implement retry logic
+
+# aegis/serving/server.py
+from fastapi import FastAPI, File, UploadFile
+import torch
+import numpy as np
+from PIL import Image
+import io
+
+app = FastAPI(title="Aegis Multimodal API")
+
+class AegisInferenceServer:
+    def __init__(self, model_path, config_path):
+        self.model = self.load_model(model_path, config_path)
+        self.model.eval()
+    
+    async def predict(self, text: str = None, image: UploadFile = None, audio: UploadFile = None):
+        inputs = {}
+        
+        if text:
+            inputs['text'] = self.process_text(text)
+        if image:
+            inputs['image'] = await self.process_image(image)
+        if audio:
+            inputs['audio'] = await self.process_audio(audio)
+        
+        with torch.no_grad():
+            predictions, features = self.model(inputs)
+        
+        return {
+            'predictions': predictions,
+            'features': features,
+            'timestamp': datetime.now().isoformat()
+        }
+
+# aegis/compression/quantizer.py
+import torch
+import torch.quantization
+
+class ModelQuantizer:
+    def __init__(self, model):
+        self.model = model
+    
+    def quantize_model(self, calibration_data):
+        """Quantize model for efficient deployment"""
+        self.model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+        torch.quantization.prepare(self.model, inplace=True)
+        
+        # Calibration
+        self.calibrate(calibration_data)
+        
+        # Convert to quantized
+        torch.quantization.convert(self.model, inplace=True)
+        return self.model
+    
+    def prune_model(self, amount=0.3):
+        """Prune model weights"""
+        parameters_to_prune = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                parameters_to_prune.append((module, 'weight'))
+        
+        torch.nn.utils.prune.global_unstructured(
+            parameters_to_prune,
+            pruning_method=torch.nn.utils.prune.L1Unstructured,
+            amount=amount
+
+            # aegis/augmentation/multimodal_augment.py
+import torch
+import torchaudio
+import torchvision.transforms as T
+from audiomentations import Compose, AddGaussianNoise
+
+class MultimodalAugmentor:
+    def __init__(self, config):
+        self.config = config
+        self.image_augment = T.Compose([
+            T.RandomHorizontalFlip(),
+            T.ColorJitter(0.2, 0.2, 0.2),
+            T.RandomAffine(degrees=15, translate=(0.1, 0.1))
+        ])
+        
+        self.audio_augment = Compose([
+            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015),
+        ])
+    
+    def augment_batch(self, batch):
+        augmented = {'inputs': {}, 'labels': batch['labels']}
+        
+        for modality, data in batch['inputs'].items():
+            if modality == 'image':
+                augmented['inputs'][modality] = self.image_augment(data)
+            elif modality == 'audio':
+                augmented['inputs'][modality] = self.audio_augment(data.numpy())
+            else:
+                augmented['inputs'][modality] = data
+        
+        return augmented
+
+# aegis/continual_learning/elastic_weight_consolidation.py
+import torch
+
+class EWCRegularizer:
+    """Elastic Weight Consolidation for continual learning"""
+    def __init__(self, model, fisher_matrix, previous_params, lambda_ewc=1000):
+        self.model = model
+        self.fisher_matrix = fisher_matrix
+        self.previous_params = previous_params
+        self.lambda_ewc = lambda_ewc
+    
+    def compute_penalty(self):
+        penalty = 0
+        for name, param in self.model.named_parameters():
+            if name in self.fisher_matrix:
+                penalty += (self.fisher_matrix[name] * 
+                           (param - self.previous_params[name]) ** 2).sum()
+        return self.lambda_ewc * penalty
+
+class ExperienceReplay:
+    """Store and replay previous examples"""
+    def __init__(self, buffer_size=1000):
+        self.buffer = []
+        self.buffer_size = buffer_size
+    
+    def add_examples(self, examples):
+        self.buffer.extend(examples)
+        if len(self.buffer) > self.buffer_size:
+            self.buffer = self.buffer[-self.buffer_size:]
+    
+    def get_replay_batch(self, batch_size):
+        indices = torch.randint(0, len(self.buffer), (batch_size,))
+        return [self.buffer[i] for i in indices]
+
+# aegis/explain/dashboard.py
+import streamlit as st
+import matplotlib.pyplot as plt
+import numpy as np
+
+class ExplanationDashboard:
+    def __init__(self, model, explainer):
+        self.model = model
+        self.explainer = explainer
+    
+    def create_dashboard(self):
+        st.title("Aegis Multimodal Explanation Dashboard")
+        
+        # Input section
+        text_input = st.text_area("Enter text")
+        image_input = st.file_uploader("Upload image", type=['png', 'jpg', 'jpeg'])
+        audio_input = st.file_uploader("Upload audio", type=['wav', 'mp3'])
+        
+        if st.button("Explain Prediction"):
+            inputs = self.process_inputs(text_input, image_input, audio_input)
+            explanations = self.explainer.explain(inputs)
+            
+            # Display explanations
+            self.display_explanations(explanations, inputs)
+    
+    def display_explanations(self, explanations, inputs):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if 'text' in explanations:
+                st.subheader("Text Importance")
+                self.plot_text_importance(explanations['text'], inputs['text'])
+        
+        with col2:
+            if 'image' in explanations:
+                st.subheader("Image Attention")
+                self.plot_image_attention(explanations['image'], inputs['image'])
+        
+        with col3:
+            if 'audio' in explanations:
+                st.subheader("Audio Features")
+                self.plot_audio_features(explanations['audio'], inputs['audio'])
+
+# aegis/optimization/performance.py
+import torch
+import time
+from memory_profiler import memory_usage
+
+class PerformanceOptimizer:
+    def __init__(self, model, dataloader):
+        self.model = model
+        self.dataloader = dataloader
+    
+    def benchmark_inference(self, num_iterations=100):
+        """Benchmark inference performance"""
+        latencies = []
+        memory_usage = []
+        
+        self.model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(self.dataloader):
+                if i >= num_iterations:
+                    break
+                
+                start_time = time.time()
+                _ = self.model(batch['inputs'])
+                end_time = time.time()
+                
+                latencies.append((end_time - start_time) * 1000)  # ms
+                memory_usage.append(memory_usage(-1, interval=0.1)[0])
+        
+        return {
+            'avg_latency_ms': np.mean(latencies),
+            'p95_latency_ms': np.percentile(latencies, 95),
+            'max_memory_mb': np.max(memory_usage),
+            'throughput_samples_s': len(latencies) / np.sum(latencies) * 1000
+        }
+    
+    def optimize_for_deployment(self):
+        """Apply deployment optimizations"""
+        # Fusion optimizations
+        torch.jit.optimize_for_inference(self.model)
+        
+        # Kernel optimizations
+        torch.backends.cudnn.benchmark = True
+        
+        # Memory optimizations
+        torch.set_flush_denormal(True)
+
+# aegis/utils/memory.py
+class MemoryManager:
+    def clear_gpu_cache(self):
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    
+    def monitor_memory_usage(self):
+        return {
+            'allocated': torch.cuda.memory_allocated(),
+            'cached': torch.cuda.memory_cached(),
+            'max_allocated': torch.cuda.max_memory_allocated()
+        }
+
+# aegis/utils/error_handling.py
+class AegisErrorHandler:
+    @staticmethod
+    def handle_modality_error(modality, data):
+        if data is None:
+            raise ValueError(f"Missing required modality: {modality}")
+        if torch.isnan(data).any():
+            raise ValueError(f"NaN values detected in {modality} data")
+    
+    @staticmethod
+    def validate_config(config):
+        required_keys = ['model', 'training', 'data']
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(f"Missing required config section: {k
+
+                # tests/test_integration.py
+class TestIntegration:
+    def test_end_to_end_training(self):
+        """Test complete training pipeline"""
+        config = load_config('configs/default.yaml')
+        model = create_model(config)
+        dataloader = create_dataloader(config)
+        trainer = AegisTrainer(model, config, dataloader)
+        
+        # Test training doesn't crash
+        try:
+            trainer.train_epoch(0)
+            assert True
+        except Exception as e:
+            assert False, f"Training failed: {e}"
+
+            
