@@ -6425,4 +6425,946 @@ result = rag_system.query("What is Aegis capable of?")
 print(f"Response: {result['response']}")
 print(f"Sources: {result['sources']}")
 
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Dict, List, Any
+from sentence_transformers import SentenceTransformer
+from PIL import Image
+import torchaudio
+import torchvision.transforms as T
+import torchaudio.transforms as AT
+import clip
+import logging
+
+logger = logging.getLogger(__name__)
+
+class MultimodalEmbedder:
+    """Unified multimodal embedding system"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._initialize_embedders()
+    
+    def _initialize_embedders(self):
+        """Initialize modality-specific embedders"""
+        # Text embedder
+        self.text_embedder = SentenceTransformer(
+            self.config.get('text_model', 'all-MiniLM-L6-v2'),
+            device=self.device
+        )
+        
+        # Image embedder (CLIP for cross-modal compatibility)
+        try:
+            self.clip_model, self.clip_preprocess = clip.load(
+                self.config.get('image_model', 'ViT-B/32'), 
+                device=self.device
+            )
+        except:
+            logger.warning("CLIP not available, using ResNet fallback")
+            self.image_embedder = torch.hub.load('pytorch/vision', 'resnet50', pretrained=True)
+            self.image_embedder = nn.Sequential(*list(self.image_embedder.children())[:-1])
+            self.image_embedder.eval()
+            self.image_preprocess = T.Compose([
+                T.Resize(256),
+                T.CenterCrop(224),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+        
+        # Audio embedder
+        self.audio_transform = T.Compose([
+            AT.MelSpectrogram(sample_rate=16000, n_mels=128),
+            AT.AmplitudeToDB()
+        ])
+        self.audio_embedder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()
+        )
+    
+    def embed(self, content: Any, modality: str) -> np.ndarray:
+        """Generate embedding for any modality"""
+        if modality == 'text':
+            return self.embed_text(content)
+        elif modality == 'image':
+            return self.embed_image(content)
+        elif modality == 'audio':
+            return self.embed_audio(content)
+        else:
+            raise ValueError(f"Unsupported modality: {modality}")
+    
+    def embed_text(self, text: str) -> np.ndarray:
+        """Embed text content"""
+        with torch.no_grad():
+            embedding = self.text_embedder.encode(text, convert_to_tensor=True)
+            return embedding.cpu().numpy()
+    
+    def embed_image(self, image_path: str) -> np.ndarray:
+        """Embed image content"""
+        try:
+            image = Image.open(image_path).convert('RGB')
+            
+            if hasattr(self, 'clip_model'):
+                # Use CLIP
+                image_tensor = self.clip_preprocess(image).unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    image_features = self.clip_model.encode_image(image_tensor)
+                    return image_features.cpu().numpy().flatten()
+            else:
+                # Use ResNet fallback
+                image_tensor = self.image_preprocess(image).unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    features = self.image_embedder(image_tensor)
+                    return features.cpu().numpy().flatten()
+                    
+        except Exception as e:
+            logger.error(f"Error embedding image {image_path}: {e}")
+            return np.zeros(512)  # Return zero vector on error
+    
+    def embed_audio(self, audio_path: str) -> np.ndarray:
+        """Embed audio content"""
+        try:
+            waveform, sample_rate = torchaudio.load(audio_path)
+            if sample_rate != 16000:
+                waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
+            
+            # Convert to mel spectrogram
+            mel_spec = self.audio_transform(waveform)
+            
+            # Add channel dimension
+            mel_spec = mel_spec.unsqueeze(0)  # [1, 1, n_mels, time]
+            
+            with torch.no_grad():
+                embedding = self.audio_embedder(mel_spec)
+                return embedding.cpu().numpy().flatten()
+                
+        except Exception as e:
+            logger.error(f"Error embedding audio {audio_path}: {e}")
+            return np.zeros(256)  # Return zero vector on error
+    
+    def cross_modal_similarity(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
+        """Calculate cross-modal similarity"""
+        return np.dot(embedding1, embedding2) / (np.linalg.norm(embedding1) * np.linalg.norm(embedding2))
+    
+    def align_embeddings(self, embeddings: List[np.ndarray]) -> np.ndarray:
+        """Project embeddings to common space"""
+        # Simple normalization for now - could use learned projection
+        return np.array([emb / np.linalg.norm(emb) for emb in embeddings])
+
+class UnifiedMultimodalRetriever:
+    """Multimodal retriever with cross-modal capabilities"""
+    
+    def __init__(self, embedder: MultimodalEmbedder):
+        self.embedder = embedder
+        self.modality_indices = {}  # FAISS indices per modality
+        self.documents = []
+    
+    def add_document(self, document: Dict[str, Any]):
+        """Add document with multimodal content"""
+        doc_id = len(self.documents)
+        self.documents.append(document)
+        
+        # Add to appropriate modality indices
+        for modality in ['text', 'image', 'audio']:
+            if modality in document:
+                content = document[modality]
+                if modality == 'text' and isinstance(content, str):
+                    embedding = self.embedder.embed_text(content)
+                elif modality == 'image' and isinstance(content, str):
+                    embedding = self.embedder.embed_image(content)
+                elif modality == 'audio' and isinstance(content, str):
+                    embedding = self.embedder.embed_audio(content)
+                else:
+                    continue
+                
+                if modality not in self.modality_indices:
+                    dim = embedding.shape[0]
+                    self.modality_indices[modality] = faiss.IndexFlatL2(dim)
+                
+                self.modality_indices[modality].add(np.array([embedding]).astype('float32'))
+    
+    def retrieve(self, query: Any, query_modality: str, top_k: int = 5, 
+                target_modality: str = None) -> List[Dict[str, Any]]:
+        """Cross-modal retrieval"""
+        if target_modality is None:
+            target_modality = query_modality
+        
+        # Embed query
+        if query_modality == 'text':
+            query_embedding = self.embedder.embed_text(query)
+        elif query_modality == 'image':
+            query_embedding = self.embedder.embed_image(query)
+        elif query_modality == 'audio':
+            query_embedding = self.embedder.embed_audio(query)
+        else:
+            raise ValueError(f"Unsupported query modality: {query_modality}")
+        
+        # Retrieve from target modality index
+        if target_modality in self.modality_indices:
+            distances, indices = self.modality_indices[target_modality].search(
+                np.array([query_embedding]).astype('float32'), top_k
+            )
+            
+            results = []
+            for i, idx in enumerate(indices[0]):
+                if idx < len(self.documents):
+                    results.append({
+                        'document': self.documents[idx],
+                        'score': float(1 / (1 + distances[0][i])),  # Convert distance to similarity
+                        'modality': target_modality
+                    })
+            
+            return results
+        
+        return []
+
+import threading
+import time
+import hashlib
+from typing import Dict, List, Any
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import json
+from pathlib import Path
+
+class RealTimeKnowledgeManager:
+    """Real-time knowledge base monitoring and updates"""
+    
+    def __init__(self, knowledge_base, rag_system, watch_dirs: List[str]):
+        self.knowledge_base = knowledge_base
+        self.rag_system = rag_system
+        self.watch_dirs = [Path(d) for d in watch_dirs]
+        self.observer = Observer()
+        self.file_hashes = {}
+        self.update_queue = []
+        self.lock = threading.Lock()
+        self.running = False
+
+ def start(self):
+        """Start real-time monitoring"""
+        self.running = True
+        
+        # Add event handlers for each directory
+        for watch_dir in self.watch_dirs:
+            if watch_dir.exists():
+                event_handler = KnowledgeUpdateHandler(self)
+                self.observer.schedule(event_handler, str(watch_dir), recursive=True)
+        
+        self.observer.start()
+        
+        # Start update processing thread
+        self.process_thread = threading.Thread(target=self._process_updates)
+        self.process_thread.daemon = True
+        self.process_thread.start()
+        
+        logger.info("Real-time knowledge monitoring started")
+    
+    def stop(self):
+        """Stop real-time monitoring"""
+        self.running = False
+        self.observer.stop()
+        self.observer.join()
+    
+    def add_update(self, file_path: str, action: str):
+        """Add file update to processing queue"""
+        with self.lock:
+            self.update_queue.append((file_path, action, time.time()))
+    
+    def _process_updates(self):
+        """Process queued updates"""
+        while self.running:
+            time.sleep(1)  # Process every second
+            
+            with self.lock:
+                if not self.update_queue:
+                    continue
+                
+                current_updates = self.update_queue.copy()
+                self.update_queue = []
+            
+            for file_path, action, timestamp in current_updates:
+                try:
+                    if action == 'created' or action == 'modified':
+                        self._handle_file_update(file_path)
+                    elif action == 'deleted':
+                        self._handle_file_deletion(file_path)
+                
+                except Exception as e:
+                    logger.error(f"Error processing update for {file_path}: {e}")
+    
+    def _handle_file_update(self, file_path: str):
+        """Handle file creation/modification"""
+        file_hash = self._compute_file_hash(file_path)
+        
+        # Check if file has actually changed
+        if file_path in self.file_hashes and self.file_hashes[file_path] == file_hash:
+            return  # No actual change
+        
+        self.file_hashes[file_path] = file_hash
+        
+        # Load and add document to knowledge base
+        try:
+            if file_path.endswith('.json'):
+                with open(file_path, 'r') as f:
+                    documents = json.load(f)
+                    if isinstance(documents, list):
+                        for doc in documents:
+                            self.knowledge_base.add_document(doc)
+                    else:
+                        self.knowledge_base.add_document(documents)
+            else:
+                # For other file types, use existing loading mechanism
+                self.knowledge_base.load_documents_from_directory(
+                    str(Path(file_path).parent),
+                    file_pattern=Path(file_path).name
+                )
+            
+            # Update RAG system
+            self.rag_system.add_documents(self.knowledge_base.documents)
+            
+            logger.info(f"Updated knowledge base with {file_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update from {file_path}: {e}")
+    
+    def _handle_file_deletion(self, file_path: str):
+        """Handle file deletion"""
+        if file_path in self.file_hashes:
+            del self.file_hashes[file_path]
+        
+        # Remove documents from this file
+        docs_to_remove = [
+            doc for doc in self.knowledge_base.documents 
+            if doc.get('source') == file_path
+        ]
+        
+        for doc in docs_to_remove:
+            self.knowledge_base.documents.remove(doc)
+        
+        # Rebuild RAG indices
+        self.rag_system.add_documents(self.knowledge_base.documents)
+        
+        logger.info(f"Removed documents from deleted file {file_path}")
+    
+    def _compute_file_hash(self, file_path: str) -> str:
+        """Compute file hash for change detection"""
+        try:
+            with open(file_path, 'rb') as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except:
+            return ""
+
+class KnowledgeUpdateHandler(FileSystemEventHandler):
+    """File system event handler for knowledge updates"""
+    
+    def __init__(self, knowledge_manager):
+        self.knowledge_manager = knowledge_manager
+    
+    def on_created(self, event):
+        if not event.is_directory:
+            self.knowledge_manager.add_update(event.src_path, 'created')
+    
+    def on_modified(self, event):
+        if not event.is_directory:
+            self.knowledge_manager.add_update(event.src_path, 'modified')
+    
+    def on_deleted(self, event):
+        if not event.is_directory:
+            self.knowledge_manager.add_update(event.src_path, 'deleted')
+
+class WebhookUpdateReceiver:
+    """Receive knowledge updates via webhooks"""
+    
+    def __init__(self, knowledge_base, rag_system, host: str = '0.0.0.0', port: int = 8080):
+        self.knowledge_base = knowledge_base
+        self.rag_system = rag_system
+        self.host = host
+        self.port = port
+        self.app = Flask(__name__)
+        self._setup_routes()
+    
+    def _setup_routes(self):
+        @self.app.route('/api/update', methods=['POST'])
+        def handle_update():
+            try:
+                data = request.get_json()
+                
+                if data.get('action') == 'add':
+                    documents = data.get('documents', [])
+                    for doc in documents:
+                        self.knowledge_base.add_document(doc)
+                    
+                    self.rag_system.add_documents(documents)
+                    return jsonify({'status': 'success', 'added': len(documents)})
+                
+                elif data.get('action') == 'remove':
+                    doc_ids = data.get('doc_ids', [])
+                    removed = 0
+                    
+                    for doc_id in doc_ids:
+                        # Find and remove document
+                        docs_to_remove = [
+                            doc for doc in self.knowledge_base.documents 
+                            if doc.get('id') == doc_id
+                        ]
+                        for doc in docs_to_remove:
+                            self.knowledge_base.documents.remove(doc)
+                            removed += 1
+                    
+                    # Rebuild indices
+                    self.rag_system.add_documents(self.knowledge_base.documents)
+                    return jsonify({'status': 'success', 'removed': removed})
+                
+                else:
+                    return jsonify({'status': 'error', 'message': 'Invalid action'})
+                    
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
+    
+    def start(self):
+        """Start webhook server"""
+        threading.Thread(target=lambda: self.app.run(
+            host=self.host, port=self.port, debug=False
+        ), daemon=True).start()
+        logger.info(f"Webhook server started on {self.host}:{self.port}")
+
+import torch
+import torch.nn as nn
+from transformers import AutoModel, AutoTokenizer
+from typing import List, Dict, Any
+import numpy as np
+
+class CrossEncoderReranker:
+    """Advanced cross-encoder for reranking"""
+    
+    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).to(self.device)
+        self.model.eval()
+    
+    def rerank(self, query: str, documents: List[Dict[str, Any]], top_k: int = 10) -> List[Dict[str, Any]]:
+        """Rerank documents using cross-encoder"""
+        if not documents:
+            return []
+        
+        # Prepare query-document pairs
+        pairs = [(query, doc.get('text', '')) for doc in documents]
+        
+        # Get scores
+        scores = self._score_pairs(pairs)
+        
+        # Combine scores with documents
+        scored_docs = []
+        for i, (doc, score) in enumerate(zip(documents, scores)):
+            scored_docs.append({
+                **doc,
+                'rerank_score': float(score),
+                'final_score': float(doc.get('score', 0.5) * 0.7 + score * 0.3)  # Weighted combination
+            })
+        
+        # Sort by final score
+        scored_docs.sort(key=lambda x: x['final_score'], reverse=True)
+        
+        return scored_docs[:top_k]
+    
+    def _score_pairs(self, pairs: List[tuple]) -> np.ndarray:
+        """Score query-document pairs"""
+        features = self.tokenizer(
+            pairs, padding=True, truncation=True, return_tensors="pt", max_length=512
+        ).to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model(**features)
+            # Use [CLS] token for classification score
+            scores = outputs.last_hidden_state[:, 0, :].mean(dim=1)
+            return scores.cpu().numpy()
+
+class MultimodalReranker:
+    """Multimodal reranking system"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.text_reranker = CrossEncoderReranker()
+        self.multimodal_embedder = MultimodalEmbedder(config)
+    
+    def rerank(self, query: str, documents: List[Dict[str, Any]], 
+               query_modality: str = "text", top_k: int = 10) -> List[Dict[str, Any]]:
+        """Multimodal reranking"""
+        if not documents:
+            return []
+        
+        # First, text-based reranking
+        text_docs = [doc for doc in documents if 'text' in doc]
+        if text_docs:
+            text_reranked = self.text_reranker.rerank(query, text_docs, top_k * 2)
+        else:
+            text_reranked = []
+        
+        # Multimodal scoring for other modalities
+        multimodal_scores = []
+        query_embedding = self.multimodal_embedder.embed(query, query_modality)
+        
+        for doc in documents:
+            modality_scores = []
+            
+            # Score each modality in the document
+            for modality in ['text', 'image', 'audio']:
+                if modality in doc and doc[modality]:
+                    try:
+                        if modality == 'text':
+                            doc_embedding = self.multimodal_embedder.embed_text(doc[modality])
+                        elif modality == 'image':
+                            doc_embedding = self.multimodal_embedder.embed_image(doc[modality])
+                        elif modality == 'audio':
+                            doc_embedding = self.multimodal_embedder.embed_audio(doc[modality])
+                        
+                        similarity = self.multimodal_embedder.cross_modal_similarity(
+                            query_embedding, doc_embedding
+                        )
+                        modality_scores.append(similarity)
+                    except:
+                        modality_scores.append(0.0)
+            
+            # Use maximum modality score
+            if modality_scores:
+                multimodal_scores.append(max(modality_scores))
+            else:
+                multimodal_scores.append(0.0)
+        
+        # Combine scores
+        scored_docs = []
+        for i, doc in enumerate(documents):
+            base_score = doc.get('score', 0.5)
+            multimodal_score = multimodal_scores[i]
+            final_score = base_score * 0.5 + multimodal_score * 0.5
+            
+            scored_docs.append({
+                **doc,
+                'multimodal_score': float(multimodal_score),
+                'final_score': float(final_score)
+            })
+        
+        # Sort and return
+        scored_docs.sort(key=lambda x: x['final_score'], reverse=True)
+        return scored_docs[:top_k]
+
+class DiversityReranker:
+    """Reranker that promotes diversity in results"""
+    
+    def __init__(self, diversity_weight: float = 0.3):
+        self.diversity_weight = diversity_weight
+    
+    def rerank(self, documents: List[Dict[str, Any]], top_k: int = 10) -> List[Dict[str, Any]]:
+        """Rerank with diversity promotion"""
+        if len(documents) <= 1:
+            return documents
+        
+        selected = []
+        remaining = documents.copy()
+        
+        # Always take top result first
+        if remaining:
+            selected.append(remaining.pop(0))
+        
+        while remaining and len(selected) < top_k:
+            best_idx = -1
+            best_score = -1
+            
+            for i, doc in enumerate(remaining):
+                # Calculate diversity score (1 - max similarity with selected)
+                max_similarity = 0
+                for sel_doc in selected:
+                    # Simple text similarity for diversity (could be improved)
+                    similarity = self._text_similarity(
+                        doc.get('text', ''), sel_doc.get('text', '')
+                    )
+                    max_similarity = max(max_similarity, similarity)
+                
+                diversity_score = 1 - max_similarity
+                combined_score = (
+                    (1 - self.diversity_weight) * doc.get('score', 0.5) +
+                    self.diversity_weight * diversity_score
+                )
+                
+                if combined_score > best_score:
+                    best_score = combined_score
+                    best_idx = i
+            
+            if best_idx >= 0:
+                selected.append(remaining.pop(best_idx))
+        
+        return selected
+    
+    def _text_similarity(self, text1: str, text2: str) -> float:
+        """Simple text similarity (could use better metrics)"""
+        if not text1 or not text2:
+            return 0.0
+        
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        return len(intersection) / len(union) if union else 0.0
+
+        import numpy as np
+from typing import List, Dict, Any
+from sklearn.metrics import precision_score, recall_score, ndcg_score
+
+class RAGEvaluator:
+    """Comprehensive RAG evaluation metrics"""
+    
+    def __init__(self):
+        self.metrics_history = []
+    
+    def evaluate_retrieval(self, query: str, retrieved_docs: List[Dict[str, Any]], 
+                          relevant_docs: List[Dict[str, Any]], k: int = 10) -> Dict[str, float]:
+        """Evaluate retrieval performance"""
+        # Convert to binary relevance
+        y_true = [1 if doc in relevant_docs else 0 for doc in retrieved_docs[:k]]
+        y_pred = [1] * len(y_true)  # All retrieved are predicted relevant
+        
+        if not y_true:
+            return {}
+        
+        # Basic metrics
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        
+        # NDCG
+        ndcg = self._calculate_ndcg(y_true, k)
+        
+        # MRR
+        mrr = self._calculate_mrr(y_true)
+        
+        return {
+            'precision@k': precision,
+            'recall@k': recall,
+            'f1@k': f1,
+            'ndcg@k': ndcg,
+            'mrr': mrr,
+            'num_retrieved': len(retrieved_docs),
+            'num_relevant': len(relevant_docs)
+        }
+    
+    def _calculate_ndcg(self, relevance_scores: List[int], k: int) -> float:
+        """Calculate Normalized Discounted Cumulative Gain"""
+        if not relevance_scores:
+            return 0.0
+        
+        # DCG
+        dcg = sum(rel / np.log2(i + 2) for i, rel in enumerate(relevance_scores[:k]))
+        
+        # Ideal DCG
+        ideal_relevance = sorted(relevance_scores, reverse=True)[:k]
+        idcg = sum(rel / np.log2(i + 2) for i, rel in enumerate(ideal_relevance))
+        
+        return dcg / idcg if idcg > 0 else 0.0
+    
+    def _calculate_mrr(self, relevance_scores: List[int]) -> float:
+        """Calculate Mean Reciprocal Rank"""
+        for i, rel in enumerate(relevance_scores):
+            if rel > 0:
+                return 1.0 / (i + 1)
+        return 0.0
+    
+    def evaluate_generation(self, generated_response: str, ground_truth: str, 
+                           context: List[Dict[str, Any]]) -> Dict[str, float]:
+        """Evaluate generation quality"""
+        # BLEU score (simplified)
+        bleu = self._calculate_bleu(generated_response, ground_truth)
+        
+        # Factual consistency with context
+        consistency = self._calculate_consistency(generated_response, context)
+        
+        # Relevance to query (simplified)
+        relevance = self._calculate_relevance(generated_response, ground_truth)
+        
+        return {
+            'bleu_score': bleu,
+            'factual_consistency': consistency,
+            'relevance': relevance,
+            'response_length': len(generated_response.split())
+        }
+    
+    def _calculate_bleu(self, candidate: str, reference: str) -> float:
+        """Simplified BLEU score calculation"""
+        candidate_words = candidate.lower().split()
+        reference_words = reference.lower().split()
+        
+        if not candidate_words or not reference_words:
+            return 0.0
+        
+        # Simple word overlap
+        common_words = set(candidate_words).intersection(set(reference_words))
+        precision = len(common_words) / len(candidate_words) if candidate_words else 0
+        recall = len(common_words) / len(reference_words) if reference_words else 0
+        
+        if precision + recall == 0:
+            return 0.0
+        
+        return 2 * precision * recall / (precision + recall)
+    
+    def _calculate_consistency(self, response: str, context: List[Dict[str, Any]]) -> float:
+        """Calculate factual consistency with context"""
+        response_words = set(response.lower().split())
+        context_text = " ".join([doc.get('text', '') for doc in context])
+        context_words = set(context_text.lower().split())
+        
+        if not response_words:
+            return 0.0
+        
+        # Words in response that are in context
+        consistent_words = response_words.intersection(context_words)
+        return len(consistent_words) / len(response_words)
+    
+    def _calculate_relevance(self, response: str, ground_truth: str) -> float:
+        """Calculate relevance to expected response"""
+        response_words = set(response.lower().split())
+        truth_words = set(ground_truth.lower().split())
+        
+        if not response_words or not truth_words:
+            return 0.0
+        
+        intersection = response_words.intersection(truth_words)
+        return len(intersection) / len(truth_words)
+    
+    def create_evaluation_report(self, queries: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create comprehensive evaluation report"""
+        retrieval_metrics = []
+        generation_metrics = []
+        
+        for query_data in queries:
+            retrieval_metrics.append(
+                self.evaluate_retrieval(
+                    query_data['query'],
+                    query_data['retrieved_docs'],
+                    query_data['relevant_docs']
+                )
+            )
+            
+            generation_metrics.append(
+                self.evaluate_generation(
+                    query_data['generated_response'],
+                    query_data['ground_truth'],
+                    query_data['context']
+                )
+            )
+        
+        # Aggregate metrics
+        agg_retrieval = self._aggregate_metrics(retrieval_metrics)
+        agg_generation = self._aggregate_metrics(generation_metrics)
+        
+        return {
+            'retrieval_metrics': agg_retrieval,
+            'generation_metrics': agg_generation,
+            'num_queries': len(queries),
+            'summary': self._create_summary(agg_retrieval, agg_generation)
+        }
+    
+    def _aggregate_metrics(self, metrics_list: List[Dict[str, float]]) -> Dict[str, Any]:
+        """Aggregate list of metrics"""
+        if not metrics_list:
+            return {}
+        
+        aggregated = {}
+        for key in metrics_list[0].keys():
+            values = [m.get(key, 0) for m in metrics_list if key in m]
+            if values:
+                aggregated[f'{key}_mean'] = np.mean(values)
+                aggregated[f'{key}_std'] = np.std(values)
+                aggregated[f'{key}_min'] = np.min(values)
+                aggregated[f'{key}_max'] = np.max(values)
+        
+        return aggregated
+    
+    def _create_summary(self, retrieval_metrics: Dict[str, Any], 
+                       generation_metrics: Dict[str, Any]) -> Dict[str, str]:
+        """Create human-readable summary"""
+        summary = {}
+        
+        # Retrieval summary
+        if 'precision@k_mean' in retrieval_metrics:
+            summary['retrieval_quality'] = (
+                "Excellent" if retrieval_metrics['precision@k_mean'] > 0.8 else
+                "Good" if retrieval_metrics['precision@k_mean'] > 0.6 else
+                "Fair" if retrieval_metrics['precision@k_mean'] > 0.4 else "Poor"
+            )
+        
+        # Generation summary
+        if 'factual_consistency_mean' in generation_metrics:
+            summary['factual_accuracy'] = (
+                "Highly accurate" if generation_metrics['factual_consistency_mean'] > 0.9 else
+                "Mostly accurate" if generation_metrics['factual_consistency_mean'] > 0.7 else
+                "Some inaccuracies" if generation_metrics['factual_consistency_mean'] > 0.5 else
+                "Significant inaccuracies"
+            )
+        
+        return summary
+
+        # aegis/web/app.py
+from flask import Flask, render_template, request, jsonify, send_file
+import json
+from pathlib import Path
+from typing import Dict, List, Any
+import threading
+from datetime import datetime
+
+app = Flask(__name__, template_folder='templates', static_folder='static')
+
+class KnowledgeManagementUI:
+    """Web interface for knowledge management"""
+    
+    def __init__(self, knowledge_base, rag_system, host: str = '0.0.0.0', port: int = 5000):
+        self.knowledge_base = knowledge_base
+        self.rag_system = rag_system
+        self.host = host
+        self.port = port
+        self._setup_routes()
+    
+    def _setup_routes(self):
+        @app.route('/')
+        def index():
+            return render_template('index.html')
+        
+        @app.route('/api/documents')
+        def get_documents():
+            page = int(request.args.get('page', 1))
+            per_page = int(request.args.get('per_page', 20))
+            search = request.args.get('search', '')
+            
+            # Filter and paginate
+            filtered_docs = self.knowledge_base.documents
+            if search:
+                filtered_docs = [
+                    doc for doc in filtered_docs
+                    if search.lower() in str(doc).lower()
+                ]
+            
+            total = len(filtered_docs)
+            start = (page - 1) * per_page
+            end = start + per_page
+            paginated_docs = filtered_docs[start:end]
+            
+            return jsonify({
+                'documents': paginated_docs,
+                'total': total,
+                'page': page,
+                'per_page': per_page,
+                'total_pages': (total + per_page - 1) // per_page
+            })
+        
+        @app.route('/api/documents', methods=['POST'])
+        def add_document():
+            try:
+                data = request.get_json()
+                document = {
+                    'id': f"doc_{datetime.now().timestamp()}",
+                    'text': data.get('text', ''),
+                    'source': data.get('source', 'manual_entry'),
+                    'modality': 'text',
+                    'timestamp': datetime.now().isoformat(),
+                    'metadata': data.get('metadata', {})
+                }
+                
+                self.knowledge_base.add_document(document)
+                self.rag_system.add_documents([document])
+                self.knowledge_base.save_knowledge_base()
+                
+                return jsonify({'status': 'success', 'document': document})
+                
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
+        
+        @app.route('/api/documents/<doc_id>', methods=['DELETE'])
+        def delete_document(doc_id):
+            try:
+                # Find and remove document
+                docs_to_remove = [
+                    doc for doc in self.knowledge_base.documents 
+                    if doc.get('id') == doc_id
+                ]
+                
+                for doc in docs_to_remove:
+                    self.knowledge_base.documents.remove(doc)
+                
+                # Rebuild RAG indices
+                self.rag_system.add_documents(self.knowledge_base.documents)
+                self.knowledge_base.save_knowledge_base()
+                
+                return jsonify({'status': 'success', 'deleted': len(docs_to_remove)})
+                
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
+        
+        @app.route('/api/search')
+        def search_documents():
+            query = request.args.get('q', '')
+            modality = request.args.get('modality', 'text')
+            top_k = int(request.args.get('top_k', 10))
+            
+            try:
+                results = self.rag_system.retrieve(query, top_k=top_k, modality=modality)
+                return jsonify({'results': results, 'query': query})
+                
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
+        
+        @app.route('/api/upload', methods=['POST'])
+        def upload_file():
+            try:
+                if 'file' not in request.files:
+                    return jsonify({'status': 'error', 'message': 'No file provided'})
+                
+                file = request.files['file']
+                if file.filename == '':
+                    return jsonify({'status': 'error', 'message': 'No file selected'})
+                
+                # Save file
+                upload_dir = Path('uploads')
+                upload_dir.mkdir(exist_ok=True)
+                file_path = upload_dir / file.filename
+                file.save(file_path)
+                
+                # Process file
+                self.knowledge_base.load_documents_from_directory(
+                    str(upload_dir), file_pattern=file.filename
+                )
+                self.rag_system.add_documents(self.knowledge_base.documents)
+                self.knowledge_base.save_knowledge_base()
+                
+                return jsonify({'status': 'success', 'file': file.filename})
+                
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
+        
+        @app.route('/api/stats')
+        def get_stats():
+            stats = {
+                'total_documents': len(self.knowledge_base.documents),
+                'modality_counts': {},
+                'index_sizes': {}
+            }
+            
+            # Count by modality
+            for doc in self.knowledge_base.documents:
+                modality = doc.get('modality', 'unknown')
+                stats['modality_counts'][modality] = stats['modality_counts'].get(modality, 0) + 1
+            
+            # Index sizes
+            if hasattr(self.
+
 
