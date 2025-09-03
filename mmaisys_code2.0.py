@@ -5743,4 +5743,686 @@ class TestIntegration:
         except Exception as e:
             assert False, f"Training failed: {e}"
 
+        # aegis/rag/core.py
+import torch
+import numpy as np
+from typing import List, Dict, Any, Optional
+from pathlib import Path
+import json
+from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
+import faiss
+import logging
+
+logger = logging.getLogger(__name__)
+
+class AegisRAGSystem:
+    """Multimodal RAG system for Aegis"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.retriever = None
+        self.generator = None
+        self.vector_index = None
+        self.knowledge_base = []
+        self._initialize_components()
+    
+    def _initialize_components(self):
+        """Initialize RAG components"""
+        # Text embedder for retrieval
+        self.embedder = SentenceTransformer(
+            self.config.get('embedding_model', 'all-MiniLM-L6-v2')
+        )
+        
+        # Initialize FAISS index for vector search
+        self._initialize_faiss_index()
+        
+        # Initialize BM25 for sparse retrieval
+        self.bm25 = None
+        self.corpus_tokens = []
+    
+    def _initialize_faiss_index(self):
+        """Initialize FAISS vector index"""
+        embedding_dim = self.embedder.get_sentence_embedding_dimension()
+        self.vector_index = faiss.IndexFlatL2(embedding_dim)
+    
+    def add_documents(self, documents: List[Dict[str, Any]]):
+        """Add documents to knowledge base"""
+        for doc in documents:
+            self.knowledge_base.append(doc)
             
+            # Add to vector index
+            if 'text' in doc:
+                embedding = self.embedder.encode(doc['text'])
+                self.vector_index.add(np.array([embedding]).astype('float32'))
+            
+            # Add to BM25 corpus
+            if 'text' in doc:
+                tokens = doc['text'].lower().split()
+                self.corpus_tokens.append(tokens)
+        
+        # Initialize BM25 after adding documents
+        if self.corpus_tokens:
+            self.bm25 = BM25Okapi(self.corpus_tokens)
+    
+    def retrieve(self, query: str, top_k: int = 5, modality: str = "text") -> List[Dict[str, Any]]:
+        """Retrieve relevant documents"""
+        if modality == "text":
+            return self._retrieve_text(query, top_k)
+        elif modality == "multimodal":
+            return self._retrieve_multimodal(query, top_k)
+        else:
+            raise ValueError(f"Unsupported modality: {modality}")
+    
+    def _retrieve_text(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """Text-based retrieval using hybrid search"""
+        results = []
+        
+        # Vector search (dense retrieval)
+        if self.vector_index.ntotal > 0:
+            query_embedding = self.embedder.encode(query)
+            distances, indices = self.vector_index.search(
+                np.array([query_embedding]).astype('float32'), top_k
+            )
+            vector_results = [self.knowledge_base[i] for i in indices[0] if i < len(self.knowledge_base)]
+            results.extend(vector_results)
+        
+        # BM25 search (sparse retrieval)
+        if self.bm25:
+            tokenized_query = query.lower().split()
+            bm25_scores = self.bm25.get_scores(tokenized_query)
+            top_indices = np.argsort(bm25_scores)[::-1][:top_k]
+            bm25_results = [self.knowledge_base[i] for i in top_indices if i < len(self.knowledge_base)]
+            results.extend(bm25_results)
+        
+        # Deduplicate and rank
+        return self._rerank_results(query, results, top_k)
+    
+    def _retrieve_multimodal(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """Multimodal retrieval (placeholder for image/audio retrieval)"""
+        # This would involve multimodal embeddings when implemented
+        return self._retrieve_text(query, top_k)
+    
+    def _rerank_results(self, query: str, results: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+        """Rerank retrieved results using cross-encoder"""
+        # Simple deduplication and ranking
+        unique_results = []
+        seen_ids = set()
+        
+        for result in results:
+            doc_id = result.get('id', hash(str(result)))
+            if doc_id not in seen_ids:
+                seen_ids.add(doc_id)
+                unique_results.append(result)
+        
+        return unique_results[:top_k]
+    
+    def generate(self, query: str, context: List[Dict[str, Any]], 
+                model: Optional[Any] = None) -> Dict[str, Any]:
+        """Generate response using retrieved context"""
+        if model is None:
+            model = self.generator
+        
+        # Prepare context string
+        context_str = self._format_context(context)
+        
+        # Generate response (this would integrate with your existing model)
+        prompt = self._create_prompt(query, context_str)
+        
+        # Use your existing Aegis model for generation
+        response = self._call_generation_model(prompt, model)
+        
+        return {
+            'response': response,
+            'context': context,
+            'sources': [doc.get('source', 'unknown') for doc in context]
+        }
+    
+    def _format_context(self, context: List[Dict[str, Any]]) -> str:
+        """Format context documents into a string"""
+        context_parts = []
+        for i, doc in enumerate(context):
+            text = doc.get('text', '')
+            source = doc.get('source', f'doc_{i}')
+            context_parts.append(f"[Source: {source}]\n{text}\n")
+        return "\n".join(context_parts)
+    
+    def _create_prompt(self, query: str, context: str) -> str:
+        """Create RAG prompt"""
+        return f"""Based on the following context information, answer the question.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
+    
+    def _call_generation_model(self, prompt: str, model: Any) -> str:
+        """Call the generation model (integrate with your existing Aegis model)"""
+        # This would use your existing multimodal model
+        # For now, placeholder implementation
+        return "This is a generated response based on the retrieved context."
+    
+    def query(self, query: str, top_k: int = 5, modality: str = "text") -> Dict[str, Any]:
+        """End-to-end RAG query"""
+        # Retrieve relevant documents
+        context = self.retrieve(query, top_k, modality)
+        
+        # Generate response
+        result = self.generate(query, context)
+        
+        return result
+
+# Example document format
+EXAMPLE_DOCUMENTS = [
+    {
+        'id': '1',
+        'text': 'Multimodal AI systems process multiple types of data including text, images, and audio.',
+        'source': 'AI Textbook Chapter 3',
+        'modality': 'text'
+    },
+    {
+        'id': '2', 
+        'text': 'Retrieval Augmented Generation improves AI responses by grounding them in factual knowledge.',
+        'source': 'Research Paper 2023',
+        'modality': 'text'
+    }
+]
+
+# aegis/rag/knowledge_base.py
+import json
+from pathlib import Path
+from typing import List, Dict, Any
+import PyPDF2
+import docx
+from PIL import Image
+import torchvision.models as models
+import torchvision.transforms as T
+
+class MultimodalKnowledgeBase:
+    """Manage multimodal knowledge documents"""
+    
+    def __init__(self, storage_path: str = "data/knowledge_base"):
+        self.storage_path = Path(storage_path)
+        self.storage_path.mkdir(parents=True, exist_ok=True)
+        self.documents = []
+        self.image_processor = self._create_image_processor()
+    
+    def _create_image_processor(self):
+        """Create image processing pipeline"""
+        return T.Compose([
+            T.Resize((224, 224)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    def load_documents_from_directory(self, directory_path: str, file_pattern: str = "**/*"):
+        """Load documents from a directory"""
+        directory = Path(directory_path)
+        
+        for file_path in directory.glob(file_pattern):
+            if file_path.is_file():
+                try:
+                    if file_path.suffix.lower() == '.pdf':
+                        self._load_pdf(file_path)
+                    elif file_path.suffix.lower() in ['.docx', '.doc']:
+                        self._load_docx(file_path)
+                    elif file_path.suffix.lower() in ['.txt', '.md']:
+                        self._load_text(file_path)
+                    elif file_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp']:
+                        self._load_image(file_path)
+                    elif file_path.suffix.lower() == '.json':
+                        self._load_json(file_path)
+                except Exception as e:
+                    print(f"Error loading {file_path}: {e}")
+    
+    def _load_pdf(self, file_path: Path):
+        """Load text from PDF file"""
+        with open(file_path, 'rb') as f:
+            pdf_reader = PyPDF2.PdfReader(f)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            
+            self.documents.append({
+                'id': str(file_path),
+                'text': text,
+                'source': str(file_path.name),
+                'modality': 'text',
+                'type': 'pdf'
+            })
+    
+    def _load_docx(self, file_path: Path):
+        """Load text from DOCX file"""
+        doc = docx.Document(file_path)
+        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        
+        self.documents.append({
+            'id': str(file_path),
+            'text': text,
+            'source': str(file_path.name),
+            'modality': 'text',
+            'type': 'docx'
+        })
+    
+    def _load_text(self, file_path: Path):
+        """Load text from plain text file"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        
+        self.documents.append({
+            'id': str(file_path),
+            'text': text,
+            'source': str(file_path.name),
+            'modality': 'text',
+            'type': 'text'
+        })
+    
+    def _load_image(self, file_path: Path):
+        """Load and process image file"""
+        image = Image.open(file_path).convert('RGB')
+        processed_image = self.image_processor(image)
+        
+        # For now, we'll just store image path and metadata
+        # In production, you'd extract features using your image encoder
+        self.documents.append({
+            'id': str(file_path),
+            'image_path': str(file_path),
+            'source': str(file_path.name),
+            'modality': 'image',
+            'type': 'image',
+            'metadata': {
+                'size': image.size,
+                'mode': image.mode
+            }
+        })
+    
+    def _load_json(self, file_path: Path):
+        """Load structured data from JSON file"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        self.documents.append({
+            'id': str(file_path),
+            'data': data,
+            'source': str(file_path.name),
+            'modality': 'structured',
+            'type': 'json'
+        })
+    
+    def add_document(self, content: Any, metadata: Dict[str, Any], modality: str = "text"):
+        """Add a document to the knowledge base"""
+        document = {
+            'id': f"doc_{len(self.documents) + 1}",
+            'modality': modality,
+            'timestamp': datetime.now().isoformat(),
+            **metadata
+        }
+        
+        if modality == "text":
+            document['text'] = content
+        elif modality == "image":
+            document['image_data'] = content  # This would be processed image features
+        elif modality == "audio":
+            document['audio_data'] = content  # This would be processed audio features
+        
+        self.documents.append(document)
+        return document
+    
+    def search_documents(self, query: str, modality: str = None, limit: int = 10) -> List[Dict[str, Any]]:
+        """Simple search within knowledge base"""
+        results = []
+        query_lower = query.lower()
+        
+        for doc in self.documents:
+            score = 0
+            
+            # Text search
+            if modality is None or modality == "text":
+                if 'text' in doc and query_lower in doc['text'].lower():
+                    score += doc['text'].lower().count(query_lower) * 10
+            
+            # Metadata search
+            if 'source' in doc and query_lower in doc['source'].lower():
+                score += 5
+            
+            if score > 0:
+                results.append({**doc, 'relevance_score': score})
+        
+        # Sort by relevance score
+        results.sort(key=lambda x: x['relevance_score'], reverse=True)
+        return results[:limit]
+    
+    def save_knowledge_base(self, file_name: str = "knowledge_base.json"):
+        """Save knowledge base to file"""
+        save_path = self.storage_path / file_name
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(self.documents, f, indent=2, ensure_ascii=False)
+    
+    def load_knowledge_base(self, file_name: str = "knowledge_base.json"):
+        """Load knowledge base from file"""
+        load_path = self.storage_path / file_name
+        if load_path.exists():
+            with open(load_path, 'r', encoding='utf-8') as f:
+                self.documents = json.load(f)
+
+                # aegis/models/rag_enhanced.py
+import torch
+import torch.nn as nn
+from typing import Dict, Any, List, Optional
+from .multimodal_model import AegisMultimodalModel
+from ..rag.core import AegisRAGSystem
+
+class RAGEnhancedModel(nn.Module):
+    """Aegis model enhanced with RAG capabilities"""
+    
+    def __init__(self, base_model: AegisMultimodalModel, rag_system: AegisRAGSystem, config: Dict[str, Any]):
+        super().__init__()
+        self.base_model = base_model
+        self.rag_system = rag_system
+        self.config = config
+        
+        # RAG-specific layers
+        self.context_encoder = nn.Linear(
+            config.get('context_dim', 512),
+            base_model.config.get('output_dim', 512)
+        )
+        self.attention_mechanism = nn.MultiheadAttention(
+            embed_dim=base_model.config.get('output_dim', 512),
+            num_heads=config.get('num_heads', 8)
+        )
+    
+    def forward(self, inputs: Dict[str, torch.Tensor], 
+                query: Optional[str] = None,
+                use_rag: bool = True,
+                top_k: int = 3) -> Dict[str, Any]:
+        """
+        Forward pass with optional RAG enhancement
+        
+        Args:
+            inputs: Multimodal inputs
+            query: Text query for retrieval
+            use_rag: Whether to use RAG
+            top_k: Number of documents to retrieve
+        """
+        
+        if use_rag and query:
+            # Retrieve relevant context
+            context_docs = self.rag_system.retrieve(query, top_k=top_k)
+            
+            if context_docs:
+                # Encode context
+                context_embeddings = self._encode_context(context_docs)
+                
+                # Get base model features
+                base_outputs, features = self.base_model(inputs)
+                
+                # Integrate context using attention
+                rag_enhanced_features = self._integrate_context(
+                    features, context_embeddings, query
+                )
+                
+                # Generate final outputs with enhanced features
+                final_outputs = {}
+                for task_name, head in self.base_model.heads.items():
+                    final_outputs[task_name] = head(rag_enhanced_features)
+                
+                return {
+                    'outputs': final_outputs,
+                    'context': context_docs,
+                    'base_outputs': base_outputs,
+                    'features': features
+                }
+        
+        # Fallback to base model without RAG
+        return self.base_model(inputs)
+    
+    def _encode_context(self, context_docs: List[Dict[str, Any]]) -> torch.Tensor:
+        """Encode retrieved context documents"""
+        context_texts = [doc.get('text', '') for doc in context_docs]
+        
+        # Use the same embedder as the retriever for consistency
+        with torch.no_grad():
+            embeddings = self.rag_system.embedder.encode(context_texts)
+            return torch.tensor(embeddings).to(self.base_model.device)
+    
+    def _integrate_context(self, features: torch.Tensor, 
+                          context_embeddings: torch.Tensor,
+                          query: str) -> torch.Tensor:
+        """Integrate context using attention mechanism"""
+        # Project context to same dimension as features
+        context_projected = self.context_encoder(context_embeddings)
+        
+        # Use attention to integrate context
+        # features as query, context as key/value
+        enhanced_features, _ = self.attention_mechanism(
+            features.unsqueeze(0),  # Add sequence dimension
+            context_projected.unsqueeze(0),
+            context_projected.unsqueeze(0)
+        )
+        
+        return enhanced_features.squeeze(0)
+    
+    def generate_with_rag(self, query: str, inputs: Optional[Dict[str, torch.Tensor]] = None,
+                         top_k: int = 5, max_length: int = 512) -> Dict[str, Any]:
+        """Generate response with RAG enhancement"""
+        # Retrieve context
+        context_docs = self.rag_system.retrieve(query, top_k=top_k)
+        
+        # Prepare inputs for generation
+        generation_inputs = self._prepare_generation_inputs(inputs, query, context_docs)
+        
+        # Generate using base model (assuming it has generation capabilities)
+        generated_output = self.base_model.generate(generation_inputs, max_length=max_length)
+        
+        return {
+            'response': generated_output,
+            'context': context_docs,
+            'sources': [doc.get('source', 'unknown') for doc in context_docs]
+        }
+    
+    def _prepare_generation_inputs(self, inputs: Optional[Dict[str, torch.Tensor]],
+                                 query: str, context_docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Prepare inputs for RAG-enhanced generation"""
+        context_text = self.rag_system._format_context(context_docs)
+        
+        # Create enhanced prompt
+        rag_prompt = self.rag_system._create_prompt(query, context_text)
+        
+        # Combine with original inputs
+        generation_inputs = inputs.copy() if inputs else {}
+        generation_inputs['text'] = rag_prompt  # Override or add text input
+        
+        return generation_inputs
+
+        # aegis/training/rag_trainer.py
+import torch
+from typing import Dict, Any, List
+from ..utils.error_handling import error_handler_decorator
+
+class RAGTrainer:
+    """Specialized trainer for RAG-enhanced models"""
+    
+    def __init__(self, model, config, train_loader, val_loader=None):
+        self.model = model
+        self.config = config
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.optimizer = self._setup_optimizer()
+        self.loss_fn = torch.nn.CrossEntropyLoss()
+        
+        # RAG-specific parameters
+        self.rag_weight = config.get('rag_weight', 1.0)
+        self.consistency_weight = config.get('consistency_weight', 0.1)
+    
+    @error_handler_decorator(context="rag_training", severity="ERROR", max_retries=3)
+    def train_epoch(self, epoch: int):
+        """Training epoch with RAG enhancement"""
+        self.model.train()
+        total_loss = 0
+        rag_accuracy = 0
+        base_accuracy = 0
+        
+        for batch_idx, batch in enumerate(self.train_loader):
+            # Prepare inputs
+            inputs = batch['inputs']
+            labels = batch['labels']
+            queries = batch.get('queries', [None] * len(inputs))
+            
+            batch_loss = 0
+            batch_rag_acc = 0
+            batch_base_acc = 0
+            
+            for i, query in enumerate(queries):
+                try:
+                    # Forward pass with RAG
+                    if query and self._should_use_rag(epoch, batch_idx):
+                        outputs = self.model(inputs[i], query=query, use_rag=True)
+                        
+                        # Calculate loss with RAG outputs
+                        loss = self._calculate_rag_loss(outputs, labels[i])
+                        rag_acc = self._calculate_accuracy(outputs['outputs'], labels[i])
+                        base_acc = self._calculate_accuracy(outputs['base_outputs'], labels[i])
+                        
+                        batch_rag_acc += rag_acc
+                        batch_base_acc += base_acc
+                    else:
+                        # Forward pass without RAG
+                        outputs = self.model(inputs[i], use_rag=False)
+                        loss = self.loss_fn(outputs, labels[i])
+                        acc = self._calculate_accuracy(outputs, labels[i])
+                        
+                        batch_base_acc += acc
+                    
+                    batch_loss += loss
+                    
+                except Exception as e:
+                    # Fallback to base model if RAG fails
+                    outputs = self.model(inputs[i], use_rag=False)
+                    loss = self.loss_fn(outputs, labels[i])
+                    batch_loss += loss
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            batch_loss.backward()
+            self.optimizer.step()
+            
+            total_loss += batch_loss.item()
+            rag_accuracy += batch_rag_acc
+            base_accuracy += batch_base_acc
+            
+            # Log progress
+            if batch_idx % self.config.get('log_interval', 100) == 0:
+                self._log_progress(epoch, batch_idx, batch_loss.item(), 
+                                 batch_rag_acc, batch_base_acc)
+        
+        return {
+            'avg_loss': total_loss / len(self.train_loader),
+            'rag_accuracy': rag_accuracy / len(self.train_loader),
+            'base_accuracy': base_accuracy / len(self.train_loader)
+        }
+    
+    def _calculate_rag_loss(self, outputs: Dict[str, Any], labels: torch.Tensor) -> torch.Tensor:
+        """Calculate loss for RAG-enhanced outputs"""
+        # Main task loss
+        main_loss = self.loss_fn(outputs['outputs'], labels)
+        
+        # Consistency loss between base and RAG outputs
+        consistency_loss = torch.nn.functional.kl_div(
+            torch.nn.functional.log_softmax(outputs['outputs'], dim=-1),
+            torch.nn.functional.softmax(outputs['base_outputs'], dim=-1),
+            reduction='batchmean'
+        )
+        
+        return main_loss + self.consistency_weight * consistency_loss
+    
+    def _calculate_accuracy(self, outputs: torch.Tensor, labels: torch.Tensor) -> float:
+        """Calculate accuracy"""
+        preds = torch.argmax(outputs, dim=-1)
+        correct = (preds == labels).float().sum()
+        return correct.item() / labels.size(0)
+    
+    def _should_use_rag(self, epoch: int, batch_idx: int) -> bool:
+        """Determine whether to use RAG in this step"""
+        # Gradually introduce RAG during training
+        rag_prob = min(epoch / self.config.get('rag_warmup_epochs', 5), 1.0)
+        return torch.rand(1).item() < rag_prob
+    
+    def _log_progress(self, epoch: int, batch_idx: int, loss: float,
+                     rag_acc: float, base_acc: float):
+        """Log training progress"""
+        print(f'Epoch {epoch}, Batch {batch_idx}: Loss={loss:.4f}, '
+              f'RAG Acc={rag_acc:.3f}, Base Acc={base_acc:.3f}')
+
+              # aegis/core/system.py
+from ..rag.core import AegisRAGSystem
+from ..rag.knowledge_base import MultimodalKnowledgeBase
+from ..models.rag_enhanced import RAGEnhancedModel
+
+class AegisSystemWithRAG:
+    """Main Aegis system with RAG integration"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.rag_system = AegisRAGSystem(config.get('rag', {}))
+        self.knowledge_base = MultimodalKnowledgeBase(
+            config.get('knowledge_base_path', 'data/knowledge_base')
+        )
+        
+        # Load existing knowledge base if available
+        self._load_knowledge_base()
+    
+    def _load_knowledge_base(self):
+        """Load knowledge base on startup"""
+        try:
+            self.knowledge_base.load_knowledge_base()
+            self.rag_system.add_documents(self.knowledge_base.documents)
+            print(f"Loaded {len(self.knowledge_base.documents)} documents into RAG system")
+        except FileNotFoundError:
+            print("No existing knowledge base found")
+    
+    def add_knowledge_source(self, source_path: str):
+        """Add new knowledge source"""
+        self.knowledge_base.load_documents_from_directory(source_path)
+        self.rag_system.add_documents(self.knowledge_base.documents)
+        self.knowledge_base.save_knowledge_base()
+    
+    def query_with_rag(self, query: str, inputs: Optional[Dict] = None, **kwargs):
+        """Query with RAG enhancement"""
+        return self.rag_system.query(query, **kwargs)
+    
+    def get_rag_enhanced_model(self, base_model):
+        """Create RAG-enhanced version of a model"""
+        return RAGEnhancedModel(base_model, self.rag_system, self.config.get('rag', {}))
+
+🚀 Usage Example
+
+
+# Initialize RAG system
+rag_config = {
+    'embedding_model': 'all-MiniLM-L6-v2',
+    'top_k': 3
+}
+rag_system = AegisRAGSystem(rag_config)
+
+# Add knowledge documents
+rag_system.add_documents([
+    {
+        'id': '1',
+        'text': 'Aegis is a multimodal AI system that processes text, images, and audio.',
+        'source': 'Aegis Documentation'
+    },
+    {
+        'id': '2',
+        'text': 'RAG enhances AI systems by providing factual context from knowledge bases.',
+        'source': 'Research Paper'
+    }
+])
+
+# Query with RAG
+result = rag_system.query("What is Aegis capable of?")
+print(f"Response: {result['response']}")
+print(f"Sources: {result['sources']}")
+
+
