@@ -9973,4 +9973,470 @@ class DockerManager:
         return {
             'removed_count':
 
+"""
+Aegis Comprehensive Test Suite
+"""
+import os
+import sys
+import asyncio
+from pathlib import Path
 
+# Add the aegis directory to the Python path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Test configuration
+TEST_CONFIG = {
+    "database_url": "sqlite+aiosqlite:///:memory:",
+    "testing": True,
+    "log_level": "ERROR",
+    "cache_enabled": False,
+    "mock_external_services": True
+}
+
+# Global test fixtures
+pytest_plugins = [
+    "tests.fixtures.database",
+    "tests.fixtures.models",
+    "tests.fixtures.auth",
+    "tests.fixtures.clients"
+]
+
+import pytest
+import pytest_asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+import torch
+import numpy as np
+from fastapi.testclient import TestClient
+
+# Global pytest configuration
+def pytest_configure(config):
+    config.option.cov_source = ["aegis"]
+    config.option.cov_report = ["term", "html", "xml"]
+    config.option.cov_fail_under = 80  # Require 80% test coverage
+
+# Async event loop
+@pytest.fixture(scope="session")
+def event_loop():
+    """Create event loop for async tests"""
+    policy = asyncio.get_event_loop_policy()
+    loop = policy.new_event_loop()
+    yield loop
+    loop.close()
+
+# Test client
+@pytest.fixture(scope="module")
+def test_client():
+    """Test client for FastAPI"""
+    from aegis.main import app
+    with TestClient(app) as client:
+        yield client
+
+# Mock models
+@pytest.fixture(scope="function")
+def mock_multimodal_model():
+    """Mock multimodal model"""
+    model = AsyncMock()
+    model.predict.return_value = {
+        "predictions": {"sentiment": "positive", "confidence": 0.95},
+        "features": {"text": [0.1, 0.2, 0.3], "image": [0.4, 0.5, 0.6]}
+    }
+    return model
+
+# Sample data generators
+@pytest.fixture(scope="function")
+def sample_text_data():
+    return "This is a test query for multimodal processing"
+
+@pytest.fixture(scope="function")
+def sample_image_data():
+    return torch.randn(1, 3, 224, 224)
+
+@pytest.fixture(scope="function")
+def sample_audio_data():
+    return torch.randn(1, 16000)
+
+# Coverage configuration
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Print test coverage summary"""
+    coverage = terminalreporter.stats.get('', [])
+    if coverage:
+        terminalreporter.write_sep('=', "Test Coverage Summary")
+        for line in coverage:
+            terminalreporter.write_line(line)
+
+ import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from aegis.data.database import Base, AegisDatabase
+
+@pytest_asyncio.fixture(scope="function")
+async def test_db_engine():
+    """Test database engine"""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    await engine.dispose()
+
+@pytest_asyncio.fixture(scope="function")
+async def test_db_session(test_db_engine):
+    """Test database session"""
+    async_session = sessionmaker(test_db_engine, class_=AsyncSession, expire_on_commit=False)
+    async with async_session() as session:
+        yield session
+
+@pytest_asyncio.fixture(scope="function")
+async def test_database():
+    """Test database instance"""
+    db = AegisDatabase({"database_url": "sqlite+aiosqlite:///:memory:"})
+    await db.connect()
+    yield db
+    # Cleanup
+    if hasattr(db, 'engine'):
+        await db.engine.dispose()          
+
+  import pytest
+from unittest.mock import MagicMock, AsyncMock
+from aegis.models.multimodal_model import AegisMultimodalModel
+from aegis.models.encoders import TextEncoder, ImageEncoder
+
+@pytest.fixture(scope="function")
+def mock_text_encoder():
+    """Mock text encoder"""
+    encoder = MagicMock(spec=TextEncoder)
+    encoder.encode.return_value = torch.randn(1, 512)
+    encoder.get_output_dim.return_value = 512
+    return encoder
+
+@pytest.fixture(scope="function")
+def mock_image_encoder():
+    """Mock image encoder"""
+    encoder = MagicMock(spec=ImageEncoder)
+    encoder.encode.return_value = torch.randn(1, 512)
+    encoder.get_output_dim.return_value = 512
+    return encoder
+
+@pytest.fixture(scope="function")
+def test_multimodal_model(mock_text_encoder, mock_image_encoder):
+    """Test multimodal model instance"""
+    config = {
+        "encoders": {
+            "text": {"model_name": "bert", "feature_dim": 512},
+            "image": {"model_name": "resnet", "feature_dim": 512}
+        },
+        "fusion": {"type": "concat", "output_dim": 1024},
+        "heads": {"sentiment": {"num_classes": 3}}
+    }
+    
+    model = AegisMultimodalModel(config)
+    model.text_encoder = mock_text_encoder
+    model.image_encoder = mock_image_encoder
+    
+    return model      
+
+    import pytest
+import torch
+import numpy as np
+from unittest.mock import MagicMock, patch
+
+class TestMultimodalModel:
+    """Unit tests for multimodal models"""
+    
+    def test_model_initialization(self, test_multimodal_model):
+        """Test model initialization"""
+        assert test_multimodal_model is not None
+        assert hasattr(test_multimodal_model, 'text_encoder')
+        assert hasattr(test_multimodal_model, 'image_encoder')
+        assert hasattr(test_multimodal_model, 'fusion')
+    
+    @pytest.mark.asyncio
+    async def test_model_forward_pass(self, test_multimodal_model):
+        """Test model forward pass"""
+        # Mock input data
+        inputs = {
+            "text": torch.randn(1, 10),
+            "image": torch.randn(1, 3, 224, 224)
+        }
+        
+        # Test forward pass
+        with torch.no_grad():
+            outputs, features = test_multimodal_model(inputs)
+        
+        assert outputs is not None
+        assert features is not None
+        assert "text" in features
+        assert "image" in features
+    
+    def test_model_encoder_registration(self):
+        """Test encoder registration system"""
+        from aegis.models.registry import register_model, get_encoder
+        
+        # Test registration
+        @register_model("test_encoder", "text")
+        class TestEncoder:
+            def __init__(self, config):
+                self.config = config
+            
+            def encode(self, x):
+                return torch.randn(1, 128)
+        
+        # Test retrieval
+        encoder = get_encoder("test_encoder", "text", {})
+        assert encoder is not None
+        
+        # Test encoding
+        result = encoder.encode("test text")
+        assert result.shape == (1, 128)
+
+        import pytest
+import pytest_asyncio
+from unittest.mock import AsyncMock, patch
+from aegis.rag.core import AegisRAGSystem
+
+class TestRAGSystem:
+    """Integration tests for RAG system"""
+    
+    @pytest_asyncio.fixture(scope="function")
+    async def test_rag_system(self):
+        """Test RAG system instance"""
+        config = {
+            "embedding_model": "all-MiniLM-L6-v2",
+            "top_k": 5,
+            "cache_enabled": False
+        }
+        rag_system = AegisRAGSystem(config)
+        yield rag_system
+    
+    @pytest.mark.asyncio
+    async def test_rag_retrieval(self, test_rag_system):
+        """Test RAG retrieval functionality"""
+        # Add test documents
+        documents = [
+            {
+                "id": "1",
+                "text": "Aegis is a multimodal AI system for text, image, and audio processing.",
+                "source": "test",
+                "modality": "text"
+            }
+        ]
+        test_rag_system.add_documents(documents)
+        
+        # Test retrieval
+        results = test_rag_system.retrieve("What is Aegis?", top_k=3)
+        assert len(results) > 0
+        assert "Aegis" in results[0]['text']
+    
+    @pytest.mark.asyncio
+    async def test_rag_generation(self, test_rag_system):
+        """Test RAG generation functionality"""
+        # Mock generation
+        with patch.object(test_rag_system, '_call_generation_model') as mock_generate:
+            mock_generate.return_value = "Aegis is a multimodal AI system."
+            
+            result = test_rag_system.generate(
+                "What is Aegis?",
+                [{"text": "Aegis processes multiple modalities.", "source": "test"}]
+            )
+            
+            assert "Aegis" in result['response']
+            mock_generate.assert_called_once()
+
+            import pytest
+from fastapi import status
+from unittest.mock import patch, AsyncMock
+
+class TestAPIEndpoints:
+    """Test API endpoints"""
+    
+    def test_health_endpoint(self, test_client):
+        """Test health endpoint"""
+        response = test_client.get("/health")
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["status"] == "healthy"
+    
+    def test_ready_endpoint(self, test_client):
+        """Test readiness endpoint"""
+        response = test_client.get("/ready")
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["status"] == "ready"
+    
+    @patch('aegis.main.get_model')
+    def test_prediction_endpoint(self, mock_get_model, test_client, mock_multimodal_model):
+        """Test prediction endpoint"""
+        mock_get_model.return_value = mock_multimodal_model
+        
+        payload = {
+            "text": "Test input text",
+            "image": "base64_encoded_image_data"
+        }
+        
+        response = test_client.post(
+            "/v1/predict",
+            json=payload,
+            headers={"X-API-Key": "test_api_key"}
+        )
+        
+        assert response.status_code == status.HTTP_200_OK
+        assert "predictions" in response.json()
+        assert "sentiment" in response.json()["predictions"]
+    
+    def test_authentication_required(self, test_client):
+        """Test authentication requirement"""
+        response = test_client.post("/v1/predict", json={"text": "test"})
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+import pytest
+import asyncio
+from locust import HttpUser, task, between
+from typing import Dict
+
+class AegisLoadTest(HttpUser):
+    """Load testing for Aegis API"""
+    wait_time = between(1, 5)
+    
+    def on_start(self):
+        """Setup test"""
+        self.headers = {"X-API-Key": "test_api_key"}
+    
+    @task(3)
+    def test_health_endpoint(self):
+        """Test health endpoint under load"""
+        self.client.get("/health", headers=self.headers)
+    
+    @task(1)
+    def test_prediction_endpoint(self):
+        """Test prediction endpoint under load"""
+        payload = {
+            "text": "This is a test query for load testing",
+            "modality": "text"
+        }
+        self.client.post("/v1/predict", json=payload, headers=self.headers)
+    
+    @task(2)
+    def test_batch_prediction(self):
+        """Test batch prediction under load"""
+        payload = {
+            "requests": [
+                {"text": f"Test query {i}", "modality": "text"}
+                for i in range(5)
+            ]
+        }
+        self.client.post("/v1/batch_predict", json=payload, headers=self.headers)
+
+# Performance test configuration
+PERF_TEST_CONFIG = {
+    "users": 100,
+    "spawn_rate": 10,
+    "time_limit": "5m",
+    "host": "http://localhost:8000"
+}
+
+import pytest
+import asyncio
+from unittest.mock import patch, AsyncMock
+from aegis.main import app
+from fastapi.testclient import TestClient
+
+class TestEndToEndWorkflow:
+    """End-to-end workflow tests"""
+    
+    @pytest.fixture(scope="class")
+    def client(self):
+        """Test client with mocked dependencies"""
+        with patch('aegis.main.get_model') as mock_model, \
+             patch('aegis.auth.advanced_auth.AdvancedAuth.verify_api_key') as mock_auth:
+            
+            # Mock model
+            mock_model.return_value = AsyncMock()
+            mock_model.return_value.predict.return_value = {
+                "predictions": {"sentiment": "positive", "confidence": 0.95}
+            }
+            
+            # Mock auth
+            mock_auth.return_value = True
+            
+            with TestClient(app) as client:
+                yield client
+    
+    def test_full_prediction_workflow(self, client):
+        """Test complete prediction workflow"""
+        # 1. Health check
+        health_response = client.get("/health")
+        assert health_response.status_code == 200
+        
+        # 2. Authentication
+        headers = {"X-API-Key": "test_api_key"}
+        
+        # 3. Prediction request
+        payload = {
+            "text": "I love this product!",
+            "modality": "text"
+        }
+        prediction_response = client.post("/v1/predict", json=payload, headers=headers)
+        
+        # 4. Verify response
+        assert prediction_response.status_code == 200
+        result = prediction_response.json()
+        assert "predictions" in result
+        assert result["predictions"]["sentiment"] == "positive"
+        
+        # 5. Verify monitoring (would check metrics in real scenario)
+        metrics_response = client.get("/metrics")
+        assert metrics_response.status_code == 200
+    
+    def test_error_handling_workflow(self, client):
+        """Test error handling workflow"""
+        # Test with invalid input
+        payload = {"invalid": "data"}
+        response = client.post("/v1/predict", json=payload, headers={"X-API-Key": "test_api_key"})
+        
+        # Should return 400 with error details
+        assert response.status_code == 400
+        assert "error" in response.json()
+
+        #!/usr/bin/env python3
+"""
+Aegis Test Runner - Comprehensive test execution script
+"""
+import subprocess
+import sys
+import os
+from pathlib import Path
+
+def run_tests(test_type: str = "all", coverage: bool = True):
+    """Run tests with specified type and coverage"""
+    test_commands = {
+        "unit": ["pytest", "tests/unit/", "-v"],
+        "integration": ["pytest", "tests/integration/", "-v"],
+        "api": ["pytest", "tests/api/", "-v"],
+        "e2e": ["pytest", "tests/e2e/", "-v"],
+        "all": ["pytest", "tests/", "-v"]
+    }
+    
+    cmd = test_commands.get(test_type, test_commands["all"])
+    
+    if coverage:
+        cmd.extend(["--cov=aegis", "--cov-report=term", "--cov-report=html"])
+    
+    # Add coverage fail-under for CI
+    if os.getenv("CI") and coverage:
+        cmd.extend(["--cov-fail-under=80"])
+    
+    print(f"Running {test_type} tests...")
+    result = subprocess.run(cmd, cwd=Path(__file__).parent.parent)
+    
+    return result.returncode
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Aegis Test Runner")
+    parser.add_argument("--type", choices=["unit", "integration", "api", "e2e", "all"],
+                       default="all", help="Test type to run")
+    parser.add_argument("--no-coverage", action="store_true", help="Disable coverage reporting")
+    
+    args = parser.parse_args()
+    
+    exit_code = run_tests(args.type, not args.no_coverage)
+    sys.exit(exit_code)
