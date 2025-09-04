@@ -8606,4 +8606,597 @@ class BlueGreenDeployer:
         """Get deployment history"""
         return self.deployment_history[-limit:]
 
+import asyncpg
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Text
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+import json
+from ..utils.error_handling import error_handler_decorator
 
+Base = declarative_base()
+
+class AegisDatabase:
+    """Production database integration for Aegis"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.engine = None
+        self.async_session = None
+        self.vector_db = None
+        
+    async def connect(self):
+        """Connect to databases"""
+        await self._connect_postgres()
+        await self._connect_vector_db()
+        
+    async def _connect_postgres(self):
+        """Connect to PostgreSQL"""
+        database_url = self.config.get('database_url')
+        if not database_url:
+            raise ValueError("Database URL not configured")
+            
+        self.engine = create_async_engine(
+            database_url,
+            echo=self.config.get('echo_sql', False),
+            pool_size=self.config.get('pool_size', 20),
+            max_overflow=self.config.get('max_overflow', 10)
+        )
+        
+        self.async_session = sessionmaker(
+            self.engine, class_=AsyncSession, expire_on_commit=False
+        )
+        
+        # Create tables if they don't exist
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    
+    async def _connect_vector_db(self):
+        """Connect to vector database (Pinecone/Weaviate)"""
+        vector_db_type = self.config.get('vector_db_type')
+        
+        if vector_db_type == 'pinecone':
+            import pinecone
+            pinecone.init(
+                api_key=self.config['pinecone_api_key'],
+                environment=self.config['pinecone_environment']
+            )
+            self.vector_db = pinecone.Index(self.config['pinecone_index_name'])
+            
+        elif vector_db_type == 'weaviate':
+            import weaviate
+            self.vector_db = weaviate.Client(
+                url=self.config['weaviate_url'],
+                auth_client_secret=weaviate.auth.AuthApiKey(
+                    api_key=self.config['weaviate_api_key']
+                )
+            )
+    
+    # SQLAlchemy Models
+    class PredictionRecord(Base):
+        __tablename__ = "prediction_records"
+        
+        id = Column(Integer, primary_key=True)
+        model_name = Column(String(100), nullable=False)
+        model_version = Column(String(50), nullable=False)
+        input_data = Column(JSON, nullable=False)
+        prediction = Column(JSON, nullable=False)
+        confidence = Column(Integer)
+        latency_ms = Column(Integer)
+        timestamp = Column(DateTime, default=datetime.utcnow)
+        user_id = Column(String(100))
+        session_id = Column(String(100))
+    
+    class ModelVersion(Base):
+        __tablename__ = "model_versions"
+        
+        id = Column(Integer, primary_key=True)
+        model_name = Column(String(100), nullable=False)
+        version = Column(String(50), nullable=False)
+        path = Column(String(500), nullable=False)
+        metrics = Column(JSON)
+        status = Column(String(20), default='development')
+        created_at = Column(DateTime, default=datetime.utcnow)
+        description = Column(Text)
+    
+    class User(Base):
+        __tablename__ = "users"
+        
+        id = Column(Integer, primary_key=True)
+        username = Column(String(100), unique=True, nullable=False)
+        email = Column(String(200), unique=True, nullable=False)
+        hashed_password = Column(String(500), nullable=False)
+        is_active = Column(Integer, default=1)
+        created_at = Column(DateTime, default=datetime.utcnow)
+        last_login = Column(DateTime)
+        permissions = Column(JSON)
+    
+    @error_handler_decorator(context="database", severity="ERROR")
+    async def log_prediction(self, prediction_data: Dict) -> int:
+        """Log prediction to database"""
+        async with self.async_session() as session:
+            record = self.PredictionRecord(**prediction_data)
+            session.add(record)
+            await session.commit()
+            return record.id
+    
+    @error_handler_decorator(context="database", severity="ERROR")
+    async def get_predictions(self, model_name: str, limit: int = 100) -> List[Dict]:
+        """Get recent predictions for a model"""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(self.PredictionRecord)
+                .where(self.PredictionRecord.model_name == model_name)
+                .order_by(self.PredictionRecord.timestamp.desc())
+                .limit(limit)
+            )
+            return [row._asdict() for row in result.all()]
+    
+    @error_handler_decorator(context="database", severity="ERROR")
+    async def store_embeddings(self, vectors: List[Dict], namespace: str = None):
+        """Store embeddings in vector database"""
+        if not self.vector_db:
+            raise ValueError("Vector database not configured")
+            
+        if isinstance(self.vector_db, pinecone.Index):
+            # Pinecone format
+            pinecone_vectors = [
+                (v['id'], v['values'], v.get('metadata', {}))
+                for v in vectors
+            ]
+            self.vector_db.upsert(vectors=pinecone_vectors, namespace=namespace)
+            
+        elif hasattr(self.vector_db, 'batch'):
+            # Weaviate format
+            with self.vector_db.batch as batch:
+                for vector in vectors:
+                    batch.add_data_object(
+                        data_object=vector['metadata'],
+                        class_name="Embedding",
+                        vector=vector['values']
+                    )
+    
+    @error_handler_decorator(context="database", severity="ERROR")
+    async def query_embeddings(self, vector: List[float], top_k: int = 10, 
+                              namespace: str = None) -> List[Dict]:
+        """Query similar embeddings"""
+        if not self.vector_db:
+            raise ValueError("Vector database not configured")
+            
+        if isinstance(self.vector_db, pinecone.Index):
+            results = self.vector_db.query(
+                vector=vector,
+                top_k=top_k,
+                include_metadata=True,
+                namespace=namespace
+            )
+            return results['matches']
+            
+        elif hasattr(self.vector_db, 'query'):
+            # Weaviate query
+            results = self.vector_db.query.get(
+                "Embedding", ["content", "metadata"]
+            ).with_near_vector({
+                "vector": vector
+            }).with_limit(top_k).do()
+            
+            return results['data']['Get']['Embedding']
+
+🔐 2. Advanced Authentication (aegis/auth/advanced_auth.py)
+python
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, APIKeyHeader, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from sqlalchemy import select
+from .database import AegisDatabase
+
+class AdvancedAuth:
+    """Production-grade authentication system"""
+    
+    def __init__(self, config: Dict, database: AegisDatabase):
+        self.config = config
+        self.db = database
+        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        self.oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+        
+        # JWT settings
+        self.secret_key = config.get('jwt_secret_key', secrets.token_urlsafe(64))
+        self.algorithm = config.get('jwt_algorithm', "HS256")
+        self.access_token_expire_minutes = config.get('access_token_expire_minutes', 30)
+    
+    def verify_password(self, plain_password: str, hashed_password: str) -> bool:
+        """Verify password against hash"""
+        return self.pwd_context.verify(plain_password, hashed_password)
+    
+    def get_password_hash(self, password: str) -> str:
+        """Hash password"""
+        return self.pwd_context.hash(password)
+    
+    async def authenticate_user(self, username: str, password: str):
+        """Authenticate user with username/password"""
+        async with self.db.async_session() as session:
+            result = await session.execute(
+                select(self.db.User).where(self.db.User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            
+            if not user or not self.verify_password(password, user.hashed_password):
+                return False
+            return user
+    
+    def create_access_token(self, data: Dict, expires_delta: Optional[timedelta] = None):
+        """Create JWT access token"""
+        to_encode = data.copy()
+        expire = datetime.utcnow() + (expires_delta or timedelta(minutes=self.access_token_expire_minutes))
+        to_encode.update({"exp": expire})
+        return jwt.encode(to_encode, self.secret_key, algorithm=self.algorithm)
+    
+    async def get_current_user(self, token: str = Depends(oauth2_scheme)):
+        """Get current user from JWT token"""
+        credentials_exception = HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        
+        try:
+            payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
+            username: str = payload.get("sub")
+            if username is None:
+                raise credentials_exception
+        except JWTError:
+            raise credentials_exception
+        
+        async with self.db.async_session() as session:
+            result = await session.execute(
+                select(self.db.User).where(self.db.User.username == username)
+            )
+            user = result.scalar_one_or_none()
+            
+            if user is None:
+                raise credentials_exception
+            return user
+    
+    async def get_current_active_user(self, current_user: dict = Depends(get_current_user)):
+        """Check if user is active"""
+        if not current_user.is_active:
+            raise HTTPException(status_code=400, detail="Inactive user")
+        return current_user
+    
+    async def has_permission(self, user: dict, permission: str) -> bool:
+        """Check if user has specific permission"""
+        user_permissions = user.permissions or []
+        return permission in user_permissions
+    
+    async def require_permission(self, permission: str, user: dict = Depends(get_current_active_user)):
+        """Dependency to require specific permission"""
+        if not await self.has_permission(user, permission):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions"
+            )
+        return user
+    
+    # OAuth2 provider functionality
+    async def create_oauth_client(self, client_data: Dict) -> str:
+        """Create OAuth2 client"""
+        client_id = secrets.token_urlsafe(16)
+        client_secret = secrets.token_urlsafe(32)
+        
+        # Store client in database
+        async with self.db.async_session() as session:
+            client = self.db.OAuthClient(
+                client_id=client_id,
+                client_secret=self.get_password_hash(client_secret),
+                **client_data
+            )
+            session.add(client)
+            await session.commit()
+        
+        return client_id, client_secret
+    
+    async def verify_oauth_client(self, client_id: str, client_secret: str) -> bool:
+        """Verify OAuth2 client credentials"""
+        async with self.db.async_session() as session:
+            result = await session.execute(
+                select(self.db.OAuthClient).where(self.db.OAuthClient.client_id == client_id)
+            )
+            client = result.scalar_one_or_none()
+            
+            if not client or not self.verify_password(client_secret, client.client_secret_hash):
+                return False
+            return True
+
+# FastAPI dependencies for easy integration
+async def get_current_user_dependency(token: str = Depends(OAuth2PasswordBearer(tokenUrl="token"))):
+    """Dependency for FastAPI routes"""
+    auth = AdvancedAuth({}, None)  # Would be properly initialized
+    return await auth.get_current_user(token)
+
+async def require_admin_dependency(user: dict = Depends(get_current_user_dependency)):
+    """Require admin permissions"""
+    if not await auth.has_permission(user, "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+    import prometheus_client
+from prometheus_client import Gauge, Counter, Histogram
+from typing import Dict, List
+import time
+from datetime import datetime
+import logging
+
+class AdvancedDashboard:
+    """Production monitoring dashboard with business metrics"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        
+        # Business metrics
+        self.active_users = Gauge('aegis_active_users', 'Active users in last 24h')
+        self.prediction_volume = Counter('aegis_predictions_total', 'Total predictions', ['model', 'status'])
+        self.revenue_metrics = Gauge('aegis_revenue_usd', 'Revenue in USD')
+        self.cost_metrics = Gauge('aegis_cost_usd', 'Infrastructure cost in USD')
+        
+        # Performance metrics
+        self.p99_latency = Gauge('aegis_p99_latency_seconds', '99th percentile latency')
+        self.error_rate = Gauge('aegis_error_rate', 'Error rate percentage')
+        self.cache_efficiency = Gauge('aegis_cache_efficiency', 'Cache hit ratio')
+        
+        # Resource metrics
+        self.gpu_utilization = Gauge('aegis_gpu_utilization', 'GPU utilization percent', ['gpu_id'])
+        self.memory_usage = Gauge('aegis_memory_usage_bytes', 'Memory usage in bytes')
+        self.api_throughput = Gauge('aegis_api_throughput_rps', 'API requests per second')
+    
+    async def update_business_metrics(self, db):
+        """Update business metrics from database"""
+        try:
+            # Active users (last 24 hours)
+            async with db.async_session() as session:
+                result = await session.execute(
+                    "SELECT COUNT(DISTINCT user_id) FROM prediction_records WHERE timestamp > NOW() - INTERVAL '24 hours'"
+                )
+                active_users = result.scalar() or 0
+                self.active_users.set(active_users)
+            
+            # Prediction volume by model
+            async with db.async_session() as session:
+                result = await session.execute(
+                    "SELECT model_name, status, COUNT(*) FROM prediction_records GROUP BY model_name, status"
+                )
+                for row in result:
+                    self.prediction_volume.labels(model=row.model_name, status=row.status).inc(row.count)
+            
+            # Revenue estimation (example)
+            # This would integrate with your billing system
+            estimated_revenue = active_users * 0.1  # Example: $0.10 per active user
+            self.revenue_metrics.set(estimated_revenue)
+            
+        except Exception as e:
+            logging.error(f"Failed to update business metrics: {e}")
+    
+    def track_slo(self, slo_name: str, value: float, target: float):
+        """Track Service Level Objectives"""
+        slo_gauge = Gauge(f'aegis_slo_{slo_name}', f'SLO for {slo_name}')
+        slo_gauge.set(value)
+        
+        # Alert if below target
+        if value < target:
+            self.trigger_alert(f"SLO violation: {slo_name} = {value:.3f} < {target}")
+    
+    def trigger_alert(self, message: str, severity: str = "warning"):
+        """Trigger alert through multiple channels"""
+        # Would integrate with PagerDuty, Slack, etc.
+        logging.warning(f"ALERT ({severity}): {message}")
+        
+        # Example: Send to Slack
+        try:
+            import requests
+            requests.post(
+                self.config.get('slack_webhook'),
+                json={'text': f'[{severity.upper()}] {message}'}
+            )
+        except:
+            pass
+    
+    def create_dashboard_metrics(self):
+        """Create comprehensive dashboard metrics"""
+        return {
+            'business': {
+                'active_users': self.active_users._value.get(),
+                'prediction_volume': self.prediction_volume._value.get(),
+                'revenue_estimate': self.revenue_metrics._value.get()
+            },
+            'performance': {
+                'p99_latency': self.p99_latency._value.get(),
+                'error_rate': self.error_rate._value.get(),
+                'cache_efficiency': self.cache_efficiency._value.get()
+            },
+            'resources': {
+                'gpu_utilization': {k: v for k, v in self.gpu_utilization._metrics.items()},
+                'memory_usage': self.memory_usage._value.get(),
+                'throughput': self.api_throughput._value.get()
+            }
+        }
+    
+    def setup_grafana_dashboard(self):
+        """Auto-generate Grafana dashboard configuration"""
+        # This would create a Grafana dashboard JSON configuration
+        dashboard_config = {
+            "title": "Aegis Production Dashboard",
+            "panels": [
+                {
+                    "title": "Business Metrics",
+                    "type": "stat",
+                    "targets": [{"expr": "aegis_active_users"}]
+                },
+                {
+                    "title": "Performance",
+                    "type": "graph", 
+                    "targets": [
+                        {"expr": "aegis_p99_latency_seconds"},
+                        {"expr": "aegis_error_rate"}
+                    ]
+                }
+            ]
+        }
+        return dashboard_config
+
+⚡ 5. Model Optimization (aegis/optimization/model_optimizer.py)
+python
+
+import torch
+import torch.nn as nn
+from torch.quantization import quantize_dynamic
+from typing import Dict, List, Optional
+import logging
+from pathlib import Path
+
+class ModelOptimizer:
+    """Production model optimization toolkit"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        
+    def quantize_model(self, model: nn.Module, quantization_type: str = "dynamic") -> nn.Module:
+        """Quantize model for efficient inference"""
+        if quantization_type == "dynamic":
+            # Dynamic quantization (weights int8, activations float32)
+            return quantize_dynamic(
+                model, 
+                {nn.Linear, nn.LSTM, nn.GRU}, 
+                dtype=torch.qint8
+            )
+            
+        elif quantization_type == "static":
+            # Static quantization (requires calibration)
+            model.eval()
+            model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+            return torch.quantization.prepare(model, inplace=False)
+            
+        else:
+            raise ValueError(f"Unsupported quantization type: {quantization_type}")
+    
+    def prune_model(self, model: nn.Module, amount: float = 0.3) -> nn.Module:
+        """Prune model weights"""
+        parameters_to_prune = []
+        
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                parameters_to_prune.append((module, 'weight'))
+        
+        # Global magnitude pruning
+        torch.nn.utils.prune.global_unstructured(
+            parameters_to_prune,
+            pruning_method=torch.nn.utils.prune.L1Unstructured,
+            amount=amount
+        )
+        
+        return model
+    
+    def optimize_for_inference(self, model: nn.Module, input_example: torch.Tensor) -> nn.Module:
+        """Apply multiple optimizations for inference"""
+        # 1. Set to eval mode
+        model.eval()
+        
+        # 2. Apply fusion
+        model = self._fuse_modules(model)
+        
+        # 3. Apply quantization
+        model = self.quantize_model(model, "dynamic")
+        
+        # 4. JIT compile
+        if self.config.get('use_jit', True):
+            try:
+                model = torch.jit.script(model)
+                # Warmup
+                with torch.no_grad():
+                    for _ in range(3):
+                        model(input_example)
+            except Exception as e:
+                logging.warning(f"JIT compilation failed: {e}")
+        
+        return model
+    
+    def _fuse_modules(self, model: nn.Module) -> nn.Module:
+        """Fuse modules for better performance"""
+        # This would be model-specific
+        # Example: fuse Conv2d + BatchNorm + ReLU
+        torch.quantization.fuse_modules(model, [['conv', 'bn', 'relu']], inplace=True)
+        return model
+    
+    def create_optimized_export(self, model: nn.Module, output_path: str, 
+                              input_example: torch.Tensor, format: str = "onnx"):
+        """Export optimized model"""
+        optimized_model = self.optimize_for_inference(model, input_example)
+        
+        if format == "onnx":
+            torch.onnx.export(
+                optimized_model,
+                input_example,
+                output_path,
+                export_params=True,
+                opset_version=13,
+                do_constant_folding=True,
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+            )
+            
+        elif format == "torchscript":
+            torch.jit.save(optimized_model, output_path)
+            
+        else:
+            raise ValueError(f"Unsupported export format: {format}")
+        
+        return output_path
+    
+    def benchmark_model(self, model: nn.Module, input_data: torch.Tensor, 
+                       num_iterations: int = 100) -> Dict[str, float]:
+        """Benchmark model performance"""
+        model.eval()
+        
+        # Warmup
+        with torch.no_grad():
+            for _ in range(10):
+                model(input_data)
+        
+        # Benchmark latency
+        start_time = time.time()
+        with torch.no_grad():
+            for _ in range(num_iterations):
+                model(input_data)
+        latency = (time.time() - start_time) / num_iterations
+        
+        # Benchmark memory
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            with torch.no_grad():
+                model(input_data)
+            memory_used = torch.cuda.max_memory_allocated()
+        else:
+            memory_used = 0
+        
+        return {
+            'latency_ms': latency * 1000,
+            'throughput_rps': 1 / latency,
+            'memory_used_mb': memory_used / (1024 ** 2),
+            'model_size_mb': self._get_model_size(model) / (1024 ** 2)
+        }
+    
+    def _get_model_size(self, model: nn.Module) -> int:
+        """Get model size in bytes"""
+        param_size = 0
+        for param in model.parameters():
+            param_size += param.nelement() * param.element_size()
+        buffer_size = 0
+        for buffer in model.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+        return param_size + buffer_size
+
+        
