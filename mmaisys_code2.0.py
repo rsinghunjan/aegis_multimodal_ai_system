@@ -10440,3 +10440,731 @@ if __name__ == "__main__":
     
     exit_code = run_tests(args.type, not args.no_coverage)
     sys.exit(exit_code)
+
+    import time
+from typing import Dict, List, Optional, Tuple
+from fastapi import Request, HTTPException, status
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import logging
+from datetime import datetime, timedelta
+import redis
+import re
+from ..utils.error_handling import CircuitBreaker
+
+logger = logging.getLogger(__name__)
+
+class AdvancedSecurityHardener:
+    """Comprehensive security hardening for Aegis"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.redis_client = self._setup_redis()
+        self.circuit_breakers: Dict[str, CircuitBreaker] = {}
+        
+        # Rate limiting settings
+        self.rate_limits = {
+            'global': Limiter(key_func=get_remote_address),
+            'user': self._user_rate_limiter,
+            'api_key': self._api_key_rate_limiter
+        }
+        
+        # Security headers
+        self.security_headers = {
+            'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+            'X-Content-Type-Options': 'nosniff',
+            'X-Frame-Options': 'DENY',
+            'X-XSS-Protection': '1; mode=block',
+            'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'",
+            'Referrer-Policy': 'strict-origin-when-cross-origin'
+        }
+    
+    def _setup_redis(self) -> Optional[redis.Redis]:
+        """Setup Redis for rate limiting and security features"""
+        try:
+            return redis.Redis(
+                host=self.config.get('redis_host', 'localhost'),
+                port=self.config.get('redis_port', 6379),
+                db=self.config.get('redis_db', 0),
+                decode_responses=True
+            )
+        except Exception as e:
+            logger.warning(f"Redis setup failed: {e}")
+            return None
+    
+    async def _user_rate_limiter(self, request: Request) -> str:
+        """Rate limiting based on user ID"""
+        user_id = getattr(request.state, 'user_id', None)
+        if user_id:
+            return f"user:{user_id}"
+        return get_remote_address(request)
+    
+    async def _api_key_rate_limiter(self, request: Request) -> str:
+        """Rate limiting based on API key"""
+        api_key = request.headers.get('X-API-Key')
+        if api_key:
+            return f"api_key:{api_key}"
+        return get_remote_address(request)
+    
+    def apply_security_headers(self, response):
+        """Apply security headers to response"""
+        for header, value in self.security_headers.items():
+            response.headers[header] = value
+        return response
+    
+    async def check_rate_limit(self, request: Request, identifier: str, 
+                             requests_per_minute: int = 60) -> bool:
+        """Advanced rate limiting with multiple strategies"""
+        if not self.redis_client:
+            return True  # Fallback if Redis unavailable
+        
+        # Get appropriate rate limit key
+        if identifier == 'user':
+            key = await self._user_rate_limiter(request)
+        elif identifier == 'api_key':
+            key = await self._api_key_rate_limiter(request)
+        else:
+            key = get_remote_address(request)
+        
+        # Use Redis for rate limiting
+        redis_key = f"rate_limit:{identifier}:{key}"
+        
+        try:
+            # Use Redis pipeline for atomic operations
+            pipe = self.redis_client.pipeline()
+            pipe.incr(redis_key)
+            pipe.expire(redis_key, 60)  # 1 minute TTL
+            current_count, _ = pipe.execute()
+            
+            if current_count > requests_per_minute:
+                raise RateLimitExceeded("Rate limit exceeded")
+                
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Rate limiting failed: {e}")
+            return True  # Fail open for reliability
+    
+    async def validate_input(self, data: any, rules: Dict) -> Tuple[bool, List[str]]:
+        """Comprehensive input validation"""
+        errors = []
+        
+        if isinstance(data, dict):
+            for field, value in data.items():
+                if field in rules:
+                    field_errors = self._validate_field(value, rules[field])
+                    errors.extend([f"{field}: {error}" for error in field_errors])
+        
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                item_errors = self._validate_field(item, rules)
+                errors.extend([f"[{i}]: {error}" for error in item_errors])
+        
+        else:
+            errors = self._validate_field(data, rules)
+        
+        return len(errors) == 0, errors
+    
+    def _validate_field(self, value: any, rules: Dict) -> List[str]:
+        """Validate a single field against rules"""
+        errors = []
+        
+        # Type validation
+        if 'type' in rules and not isinstance(value, rules['type']):
+            errors.append(f"Must be {rules['type'].__name__}")
+        
+        # Length validation
+        if 'min_length' in rules and len(str(value)) < rules['min_length']:
+            errors.append(f"Minimum length {rules['min_length']}")
+        if 'max_length' in rules and len(str(value)) > rules['max_length']:
+            errors.append(f"Maximum length {rules['max_length']}")
+        
+        # Value validation
+        if 'min_value' in rules and value < rules['min_value']:
+            errors.append(f"Minimum value {rules['min_value']}")
+        if 'max_value' in rules and value > rules['max_value']:
+            errors.append(f"Maximum value {rules['max_value']}")
+        
+        # Pattern validation
+        if 'pattern' in rules and isinstance(value, str):
+            if not re.match(rules['pattern'], value):
+                errors.append("Invalid format")
+        
+        # Enum validation
+        if 'enum' in rules and value not in rules['enum']:
+            errors.append(f"Must be one of {rules['enum']}")
+        
+        return errors
+    
+    def audit_log(self, action: str, user_id: Optional[str] = None, 
+                 details: Dict = None, level: str = "INFO"):
+        """Comprehensive audit logging"""
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'action': action,
+            'user_id': user_id,
+            'ip_address': get_remote_address(Request),
+            'details': details or {},
+            'level': level
+        }
+        
+        # Log to multiple destinations
+        if level == "ERROR":
+            logger.error(json.dumps(log_entry))
+        elif level == "WARNING":
+            logger.warning(json.dumps(log_entry))
+        else:
+            logger.info(json.dumps(log_entry))
+        
+        # Store in Redis for recent audit trail
+        if self.redis_client:
+            try:
+                audit_key = f"audit:{datetime.now().strftime('%Y%m%d')}"
+                self.redis_client.lpush(audit_key, json.dumps(log_entry))
+                self.redis_client.ltrim(audit_key, 0, 1000)  # Keep last 1000 entries
+            except Exception as e:
+                logger.warning(f"Audit log storage failed: {e}")
+    
+    def get_circuit_breaker(self, service_name: str) -> CircuitBreaker:
+        """Get or create circuit breaker for a service"""
+        if service_name not in self.circuit_breakers:
+            self.circuit_breakers[service_name] = CircuitBreaker(
+                service_name, 
+                max_failures=self.config.get('circuit_breaker_failures', 5),
+                reset_timeout=self.config.get('circuit_breaker_timeout', 60)
+            )
+        return self.circuit_breakers[service_name]
+    
+    async def check_security_headers(self, request: Request) -> bool:
+        """Check request for security issues"""
+        # Check for suspicious headers
+        suspicious_headers = ['X-Forwarded-For', 'X-Real-IP', 'X-Original-URL']
+        for header in suspicious_headers:
+            if header in request.headers and request.headers[header]:
+                self.audit_log("suspicious_header", details={'header': header})
+        
+        # Check user agent
+        user_agent = request.headers.get('User-Agent', '')
+        if not user_agent or len(user_agent) > 256:
+            self.audit_log("suspicious_user_agent", details={'user_agent': user_agent})
+        
+        return True
+
+        import time
+import asyncio
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+import psutil
+import GPUtil
+from functools import lru_cache
+from contextlib import asynccontextmanager
+import logging
+from dataclasses import dataclass
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+class OptimizationStrategy(Enum):
+    MEMORY = "memory"
+    LATENCY = "latency"
+    THROUGHPUT = "throughput"
+    BALANCED = "balanced"
+
+@dataclass
+class PerformanceMetrics:
+    latency_ms: float
+    memory_usage_mb: float
+    throughput_rps: float
+    cache_hit_rate: float
+    error_rate: float
+    timestamp: datetime
+
+class AdvancedPerformanceOptimizer:
+    """Comprehensive performance optimization system"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.metrics_history: List[PerformanceMetrics] = []
+        self.optimization_strategy = OptimizationStrategy.BALANCED
+        self.connection_pools: Dict[str, Any] = {}
+        
+    async def optimize_cold_start(self):
+        """Optimize application cold start time"""
+        start_time = time.time()
+        
+        # Pre-warm components
+        await self._pre_warm_models()
+        await self._pre_warm_database()
+        await self._pre_warm_cache()
+        
+        cold_start_time = time.time() - start_time
+        logger.info(f"Cold start optimized: {cold_start_time:.2f}s")
+        
+        return cold_start_time
+    
+    async def _pre_warm_models(self):
+        """Pre-warm ML models"""
+        try:
+            # Load models in parallel
+            tasks = []
+            for model_name in self.config.get('pre_warm_models', []):
+                tasks.append(self._load_model_async(model_name))
+            
+            await asyncio.gather(*tasks)
+            
+        except Exception as e:
+            logger.warning(f"Model pre-warming failed: {e}")
+    
+    async def _load_model_async(self, model_name: str):
+        """Load model asynchronously"""
+        # Implementation would load specific model
+        await asyncio.sleep(0.1)  # Simulate loading
+    
+    async def _pre_warm_database(self):
+        """Pre-warm database connections"""
+        try:
+            # Create connection pool
+            if self.config.get('database_pre_warm', True):
+                await self._initialize_connection_pool()
+                
+        except Exception as e:
+            logger.warning(f"Database pre-warming failed: {e}")
+    
+    async def _pre_warm_cache(self):
+        """Pre-warm cache"""
+        try:
+            # Pre-load frequently accessed data
+            if self.config.get('cache_pre_warm', True):
+                await self._pre_load_cache_data()
+                
+        except Exception as e:
+            logger.warning(f"Cache pre-warming failed: {e}")
+    
+    @asynccontextmanager
+    async def get_connection(self, service: str):
+        """Get connection from pool with automatic management"""
+        if service not in self.connection_pools:
+            self.connection_pools[service] = await self._create_connection_pool(service)
+        
+        connection = None
+        try:
+            connection = await self.connection_pools[service].acquire()
+            yield connection
+        finally:
+            if connection:
+                await self.connection_pools[service].release(connection)
+    
+    async def _create_connection_pool(self, service: str):
+        """Create connection pool for a service"""
+        # Implementation would create appropriate connection pool
+        # For database, HTTP, Redis, etc.
+        return ConnectionPool(service, self.config)
+    
+    def monitor_performance(self) -> PerformanceMetrics:
+        """Monitor current performance metrics"""
+        try:
+            metrics = PerformanceMetrics(
+                latency_ms=self._measure_latency(),
+                memory_usage_mb=self._measure_memory(),
+                throughput_rps=self._measure_throughput(),
+                cache_hit_rate=self._measure_cache_hit_rate(),
+                error_rate=self._measure_error_rate(),
+                timestamp=datetime.now()
+            )
+            
+            self.metrics_history.append(metrics)
+            self._trim_metrics_history()
+            
+            return metrics
+            
+        except Exception as e:
+            logger.error(f"Performance monitoring failed: {e}")
+            return PerformanceMetrics(0, 0, 0, 0, 0, datetime.now())
+    
+    def _measure_latency(self) -> float:
+        """Measure current latency"""
+        # Implementation would measure request latency
+        return 50.0  # Example value
+    
+    def _measure_memory(self) -> float:
+        """Measure memory usage"""
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 / 1024  # MB
+    
+    def _measure_throughput(self) -> float:
+        """Measure requests per second"""
+        # Implementation would calculate throughput
+        return 100.0  # Example value
+    
+    def _measure_cache_hit_rate(self) -> float:
+        """Measure cache hit rate"""
+        # Implementation would calculate from cache stats
+        return 0.85  # Example value
+    
+    def _measure_error_rate(self) -> float:
+        """Measure error rate"""
+        # Implementation would calculate from error logs
+        return 0.01  # Example value
+    
+    def _trim_metrics_history(self):
+        """Trim metrics history to configured limit"""
+        max_history = self.config.get('metrics_history_size', 1000)
+        if len(self.metrics_history) > max_history:
+            self.metrics_history = self.metrics_history[-max_history:]
+    
+    def optimize_based_on_metrics(self) -> Dict[str, Any]:
+        """Optimize based on performance metrics"""
+        if not self.metrics_history:
+            return {}
+        
+        current_metrics = self.metrics_history[-1]
+        recommendations = []
+        
+        # Memory optimization
+        if current_metrics.memory_usage_mb > self.config.get('memory_threshold', 1024):
+            recommendations.append({
+                'type': 'memory',
+                'action': 'Reduce batch size or enable garbage collection',
+                'priority': 'high'
+            })
+        
+        # Latency optimization
+        if current_metrics.latency_ms > self.config.get('latency_threshold', 100):
+            recommendations.append({
+                'type': 'latency',
+                'action': 'Enable response caching or optimize queries',
+                'priority': 'high'
+            })
+        
+        # Cache optimization
+        if current_metrics.cache_hit_rate < self.config.get('cache_threshold', 0.8):
+            recommendations.append({
+                'type': 'cache',
+                'action': 'Increase cache size or optimize cache keys',
+                'priority': 'medium'
+            })
+        
+        return {
+            'recommendations': recommendations,
+            'current_metrics': current_metrics.__dict__
+        }
+    
+    @lru_cache(maxsize=128)
+    def cached_operation(self, key: str, operation: callable, *args, **kwargs):
+        """LRU cache decorator for expensive operations"""
+        return operation(*args, **kwargs)
+    
+    async def batch_processing(self, items: List[Any], batch_size: int = 32):
+        """Optimized batch processing with memory management"""
+        results = []
+        
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i + batch_size]
+            
+            # Process batch
+            batch_results = await self._process_batch(batch)
+            results.extend(batch_results)
+            
+            # Memory management
+            if self._should_garbage_collect():
+                import gc
+                gc.collect()
+                
+            # Yield control to event loop
+            await asyncio.sleep(0)
+        
+        return results
+    
+    def _should_garbage_collect(self) -> bool:
+        """Check if garbage collection is needed"""
+        memory_usage = psutil.virtual_memory().percent
+        return memory_usage > 80  # GC if memory usage > 80%
+    
+    async def _process_batch(self, batch: List[Any]):
+        """Process a single batch"""
+        # Implementation would process the batch
+        return batch
+
+        import asyncpg
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+import asyncio
+from contextlib import asynccontextmanager
+import logging
+from pathlib import Path
+import alembic
+from alembic.config import Config
+from alembic import command
+import json
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+class DatabaseType(Enum):
+    POSTGRESQL = "postgresql"
+    MYSQL = "mysql"
+    SQLITE = "sqlite"
+
+class AdvancedDatabaseManager:
+    """Advanced database management with migrations and connection pooling"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.engine = None
+        self.async_session = None
+        self.connection_pool = None
+        self.migration_manager = MigrationManager(config)
+        
+    async def connect(self):
+        """Connect to database with connection pooling"""
+        try:
+            database_url = self.config['database_url']
+            pool_size = self.config.get('pool_size', 20)
+            max_overflow = self.config.get('max_overflow', 10)
+            
+            self.engine = create_async_engine(
+                database_url,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=30,
+                pool_recycle=1800,  # Recycle connections every 30 minutes
+                pool_pre_ping=True,  # Check connection health before use
+                echo=self.config.get('echo_sql', False)
+            )
+            
+            self.async_session = sessionmaker(
+                self.engine, class_=AsyncSession, expire_on_commit=False
+            )
+            
+            # Test connection
+            async with self.engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            
+            logger.info("Database connected with connection pooling")
+            
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            raise
+    
+    @asynccontextmanager
+    async def get_session(self):
+        """Get database session with automatic management"""
+        session = self.async_session()
+        try:
+            yield session
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+    
+    async def execute_migration(self, migration_type: str = "upgrade", revision: str = "head"):
+        """Execute database migrations"""
+        return await self.migration_manager.execute_migration(migration_type, revision)
+    
+    async def backup_database(self, backup_path: Optional[str] = None):
+        """Create database backup"""
+        backup_path = backup_path or self._generate_backup_path()
+        
+        try:
+            if self.config['database_type'] == DatabaseType.POSTGRESQL:
+                await self._backup_postgresql(backup_path)
+            elif self.config['database_type'] == DatabaseType.MYSQL:
+                await self._backup_mysql(backup_path)
+            else:
+                logger.warning(f"Backup not supported for {self.config['database_type']}")
+                return None
+            
+            logger.info(f"Database backup created: {backup_path}")
+            return backup_path
+            
+        except Exception as e:
+            logger.error(f"Database backup failed: {e}")
+            return None
+    
+    async def _backup_postgresql(self, backup_path: str):
+        """Backup PostgreSQL database"""
+        import subprocess
+        import shutil
+        
+        # Use pg_dump for PostgreSQL
+        cmd = [
+            'pg_dump',
+            '-h', self.config['host'],
+            '-p', str(self.config.get('port', 5432)),
+            '-U', self.config['username'],
+            '-d', self.config['database'],
+            '-f', backup_path,
+            '-F', 'c'  # Custom format
+        ]
+        
+        # Set password environment variable
+        env = os.environ.copy()
+        env['PGPASSWORD'] = self.config['password']
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            raise Exception(f"pg_dump failed: {stderr.decode()}")
+    
+    async def restore_database(self, backup_path: str):
+        """Restore database from backup"""
+        try:
+            if self.config['database_type'] == DatabaseType.POSTGRESQL:
+                await self._restore_postgresql(backup_path)
+            elif self.config['database_type'] == DatabaseType.MYSQL:
+                await self._restore_mysql(backup_path)
+            else:
+                logger.warning(f"Restore not supported for {self.config['database_type']}")
+                return False
+            
+            logger.info(f"Database restored from: {backup_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Database restore failed: {e}")
+            return False
+    
+    def _generate_backup_path(self) -> str:
+        """Generate backup file path"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = self.config.get('backup_dir', 'backups')
+        Path(backup_dir).mkdir(exist_ok=True)
+        return f"{backup_dir}/backup_{timestamp}.dump"
+    
+    async def optimize_queries(self):
+        """Optimize database queries and performance"""
+        try:
+            async with self.get_session() as session:
+                # Analyze and optimize tables
+                if self.config['database_type'] == DatabaseType.POSTGRESQL:
+                    await session.execute(text("ANALYZE"))
+                    await session.execute(text("VACUUM ANALYZE"))
+                
+                # Optimize indexes
+                await self._optimize_indexes(session)
+                
+            logger.info("Database optimization completed")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Database optimization failed: {e}")
+            return False
+    
+    async def _optimize_indexes(self, session):
+        """Optimize database indexes"""
+        # Implementation would analyze and optimize indexes
+        # This is database-specific
+        pass
+    
+    async def monitor_performance(self) -> Dict[str, Any]:
+        """Monitor database performance"""
+        try:
+            async with self.get_session() as session:
+                if self.config['database_type'] == DatabaseType.POSTGRESQL:
+                    return await self._monitor_postgresql(session)
+                else:
+                    return {"status": "monitoring_not_supported"}
+                    
+        except Exception as e:
+            logger.error(f"Database monitoring failed: {e}")
+            return {"error": str(e)}
+    
+    async def _monitor_postgresql(self, session) -> Dict[str, Any]:
+        """Monitor PostgreSQL performance"""
+        # Get database statistics
+        result = await session.execute(text("""
+            SELECT 
+                COUNT(*) as total_connections,
+                SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END) as active_connections,
+                MAX(age(backend_start)) as oldest_connection_age
+            FROM pg_stat_activity
+        """))
+        stats = result.first()
+        
+        # Get cache hit ratio
+        result = await session.execute(text("""
+            SELECT 
+                SUM(heap_blks_hit) / NULLIF(SUM(heap_blks_hit) + SUM(heap_blks_read), 0) as cache_hit_ratio
+            FROM pg_statio_user_tables
+        """))
+        cache_stats = result.first()
+        
+        return {
+            "total_connections": stats.total_connections,
+            "active_connections": stats.active_connections,
+            "oldest_connection_age": stats.oldest_connection_age,
+            "cache_hit_ratio": float(cache_stats.cache_hit_ratio) if cache_stats.cache_hit_ratio else 0,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    async def close(self):
+        """Close database connections"""
+        if self.engine:
+            await self.engine.dispose()
+            logger.info("Database connections closed")
+
+class MigrationManager:
+    """Database migration management with Alembic"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.alembic_cfg = self._setup_alembic()
+    
+    def _setup_alembic(self):
+        """Setup Alembic configuration"""
+        alembic_cfg = Config()
+        alembic_cfg.set_main_option("script_location", "migrations")
+        alembic_cfg.set_main_option("sqlalchemy.url", self.config['database_url'])
+        return alembic_cfg
+    
+    async def execute_migration(self, migration_type: str = "upgrade", revision: str = "head"):
+        """Execute database migration"""
+        try:
+            if migration_type == "upgrade":
+                command.upgrade(self.alembic_cfg, revision)
+            elif migration_type == "downgrade":
+                command.downgrade(self.alembic_cfg, revision)
+            elif migration_type == "revision":
+                command.revision(self.alembic_cfg, autogenerate=True, message=revision)
+            else:
+                raise ValueError(f"Unknown migration type: {migration_type}")
+            
+            logger.info(f"Migration {migration_type} to {revision} completed")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Migration failed: {e}")
+            return False
+    
+    async def check_migration_status(self):
+        """Check migration status"""
+        try:
+            # Get current revision
+            current_rev = command.current(self.alembic_cfg)
+            
+            # Get available revisions
+            revisions = []
+            for script in command.heads(self.alembic_cfg):
+                revisions.append(script)
+            
+            return {
+                "current_revision": current_rev,
+                "available_revisions": revisions,
+                "needs_migration": current_rev != revisions[-1] if revisions else False
+            }
+            
+        except Exception as e:
+            logger.error(f"Migration status check failed: {e}")
+            return {"error": str(e)}
+
+            
