@@ -9199,4 +9199,157 @@ class ModelOptimizer:
             buffer_size += buffer.nelement() * buffer.element_size()
         return param_size + buffer_size
 
+        # tests/conftest.py
+import pytest
+import pytest_asyncio
+from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from unittest.mock import AsyncMock, MagicMock
+import torch
+import numpy as np
+
+# Test configuration
+@pytest.fixture(scope="session")
+def test_config():
+    return {
+        "database_url": "sqlite+aiosqlite:///:memory:",
+        "testing": True,
+        "log_level": "ERROR"
+    }
+
+# Async database session
+@pytest_asyncio.fixture(scope="function")
+async def test_db_session(test_config):
+    engine = create_async_engine(test_config["database_url"])
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    
+    async with async_session() as session:
+        yield session
+    
+    await engine.dispose()
+
+# Test client
+@pytest.fixture(scope="module")
+def test_client():
+    from aegis.main import app
+    with TestClient(app) as client:
+        yield client
+
+# Mock models
+@pytest.fixture(scope="function")
+def mock_model():
+    model = AsyncMock()
+    model.predict.return_value = {"prediction": "test", "confidence": 0.95}
+    return model
+
+# Test data generators
+@pytest.fixture(scope="function")
+def sample_image_data():
+    return torch.randn(1, 3, 224, 224)
+
+@pytest.fixture(scope="function") 
+def sample_text_data():
+    return "This is a test query for multimodal processing"
+
+# Coverage configuration
+def pytest_configure(config):
+    config.option.cov_source = ["aegis"]
+    config.option.cov_report = ["term", "html"]
+
+python
+
+# tests/test_production.py
+import pytest
+import pytest_asyncio
+from fastapi import status
+from unittest.mock import patch, AsyncMock
+
+class TestProductionFeatures:
+    """Production feature tests"""
+    
+    @pytest.mark.asyncio
+    async def test_database_integration(self, test_db_session):
+        """Test database integration"""
+        from aegis.data.database import AegisDatabase
         
+        db = AegisDatabase({"database_url": "sqlite+aiosqlite:///:memory:"})
+        await db.connect()
+        
+        # Test prediction logging
+        prediction_id = await db.log_prediction({
+            "model_name": "test_model",
+            "model_version": "v1",
+            "input_data": {"text": "test"},
+            "prediction": {"label": "positive"},
+            "confidence": 0.95,
+            "latency_ms": 100
+        })
+        
+        assert prediction_id is not None
+        
+        # Test retrieval
+        predictions = await db.get_predictions("test_model", 10)
+        assert len(predictions) == 1
+    
+    @pytest.mark.asyncio
+    async def test_authentication(self, test_client):
+        """Test authentication system"""
+        # Test login
+        response = test_client.post("/token", data={
+            "username": "testuser",
+            "password": "testpass"
+        })
+        
+        assert response.status_code == status.HTTP_200_OK
+        assert "access_token" in response.json()
+        
+        # Test protected endpoint
+        token = response.json()["access_token"]
+        response = test_client.get("/protected", headers={
+            "Authorization": f"Bearer {token}"
+        })
+        
+        assert response.status_code == status.HTTP_200_OK
+    
+    def test_model_optimization(self, sample_image_data):
+        """Test model optimization"""
+        from aegis.optimization.model_optimizer import ModelOptimizer
+        
+        # Create a simple test model
+        model = torch.nn.Sequential(
+            torch.nn.Linear(10, 20),
+            torch.nn.ReLU(),
+            torch.nn.Linear(20, 1)
+        )
+        
+        optimizer = ModelOptimizer({})
+        optimized_model = optimizer.optimize_for_inference(model, torch.randn(1, 10))
+        
+        # Test that optimization worked
+        assert optimized_model is not None
+        
+        # Benchmark
+        metrics = optimizer.benchmark_model(optimized_model, torch.randn(1, 10))
+        assert "latency_ms" in metrics
+    
+    @pytest.mark.asyncio
+    async def test_monitoring(self):
+        """Test monitoring system"""
+        from aegis.monitoring.advanced_dashboard import AdvancedDashboard
+        
+        dashboard = AdvancedDashboard({})
+        
+        # Test metric collection
+        dashboard.active_users.set(100)
+        assert dashboard.active_users._value.get() == 100
+        
+        # Test alerting
+        with patch.object(dashboard, 'trigger_alert') as mock_alert:
+            dashboard.trigger_alert("Test alert")
+            mock_alert.assert_called_once()
+
+
