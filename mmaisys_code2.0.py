@@ -7367,4 +7367,626 @@ class KnowledgeManagementUI:
             # Index sizes
             if hasattr(self.
 
+class ModelRegistry:
+    """Central model registry with versioning"""
+    def __init__(self):
+        self.models = {}
+        self.versions = {}
+    
+    def register_model(self, name: str, model: nn.Module, metadata: Dict):
+        """Register a model with version tracking"""
+        version = self._generate_version(name)
+        self.models[name] = model
+        self.versions[name] = self.versions.get(name, []) + [{
+            'version': version,
+            'timestamp': datetime.now(),
+            'metadata': metadata,
+            'performance': {}
+        }]
+        return version
+
+        from fastapi import FastAPI, HTTPException
+import uvicorn
+
+class AegisAPIServer:
+    """Production-ready API server"""
+    def __init__(self, config: Dict):
+        self.app = FastAPI(title="Aegis Multimodal API")
+        self._setup_routes()
+        self.config = config
+    
+    def _setup_routes(self):
+        @self.app.post("/predict")
+        async def predict(request: PredictionRequest):
+            try:
+                result = await self.model.predict(request)
+                return PredictionResponse(**result)
+            except Exception as e:
+                raise HTTPException(500, str(e))
+
+     class MonitoringDashboard:
+    """Real-time monitoring dashboard"""
+    def __init__(self):
+        self.metrics = {}
+        self.alert_rules = {}
+    
+    def add_metric(self, name: str, value: float, tags: Dict = None):
+        """Track a metric"""
+        if name not in self.metrics:
+            self.metrics[name] = []
+        self.metrics[name].append({
+            'value': value,
+            'timestamp': time.time(),
+            'tags': tags or {}
+        })
+    
+    def check_alerts(self):
+        """Check all alert rules"""
+        triggered = []
+        for rule_name, rule in self.alert_rules.items():
+            if self._evaluate_rule(rule):
+                triggered.append(rule_name)
+        return triggered
+
+        import uvicorn
+from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.security import APIKeyHeader
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+import logging
+from typing import Dict, List, Optional
+import time
+from prometheus_fastapi_instrumentator import Instrumentator
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
+class AegisProductionServer:
+    """Production-grade FastAPI server for Aegis"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.app = FastAPI(
+            title="Aegis Multimodal API",
+            description="Production API for Aegis Multimodal AI System",
+            version="1.0.0",
+            docs_url="/docs" if config.get('enable_docs', True) else None,
+            redoc_url="/redoc" if config.get('enable_docs', True) else None
+        )
+        
+        self._setup_middleware()
+        self._setup_routes()
+        self._setup_metrics()
+        
+    def _setup_middleware(self):
+        """Setup production middleware"""
+        # CORS
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=self.config.get('allowed_origins', ["*"]),
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        # Trusted hosts
+        self.app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=self.config.get('allowed_hosts', ["*"])
+        )
+        
+        # GZip compression
+        self.app.add_middleware(GZipMiddleware, minimum_size=1000)
+        
+        # Rate limiting
+        self.app.state.limiter = limiter
+        self.app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        self.app.add_middleware(SlowAPIMiddleware)
+        
+    def _setup_metrics(self):
+        """Setup Prometheus metrics"""
+        Instrumentator().instrument(self.app).expose(self.app)
+        
+    def _setup_routes(self):
+        """Setup API routes"""
+        # Health checks
+        @self.app.get("/health")
+        async def health_check():
+            return {"status": "healthy", "timestamp": time.time()}
+        
+        @self.app.get("/ready")
+        async def readiness_check():
+            # Check database connections, model loading, etc.
+            return {"status": "ready", "timestamp": time.time()}
+        
+        # Prediction endpoints
+        @self.app.post("/v1/predict")
+        @limiter.limit("10/minute")
+        async def predict(request: Dict, api_key: str = Security(APIKeyHeader(name="X-API-Key"))):
+            try:
+                # Validate API key
+                if not self._validate_api_key(api_key):
+                    raise HTTPException(401, "Invalid API key")
+                
+                # Process prediction
+                result = await self._process_prediction(request)
+                return result
+                
+            except Exception as e:
+                logging.error(f"Prediction error: {e}")
+                raise HTTPException(500, f"Prediction failed: {str(e)}")
+        
+        # Batch prediction
+        @self.app.post("/v1/batch_predict")
+        @limiter.limit("5/minute")
+        async def batch_predict(requests: List[Dict], api_key: str = Security(APIKeyHeader(name="X-API-Key"))):
+            try:
+                if not self._validate_api_key(api_key):
+                    raise HTTPException(401, "Invalid API key")
+                
+                results = []
+                for request in requests:
+                    result = await self._process_prediction(request)
+                    results.append(result)
+                
+                return {"results": results}
+                
+            except Exception as e:
+                logging.error(f"Batch prediction error: {e}")
+                raise HTTPException(500, f"Batch prediction failed: {str(e)}")
+    
+    def _validate_api_key(self, api_key: str) -> bool:
+        """Validate API key"""
+        valid_keys = self.config.get('api_keys', [])
+        return api_key in valid_keys
+    
+    async def _process_prediction(self, request: Dict) -> Dict:
+        """Process prediction request"""
+        # Implementation would use your existing model
+        return {"prediction": "result", "confidence": 0.95}
+    
+    def run(self, host: str = "0.0.0.0", port: int = 8000):
+        """Run the production server"""
+        uvicorn.run(
+            self.app,
+            host=host,
+            port=port,
+            log_level="info",
+            timeout_keep_alive=120,
+            workers=self.config.get('workers', 4)
+        )
+
+        import prometheus_client
+from prometheus_client import Counter, Gauge, Histogram, Summary
+import time
+from typing import Dict, List, Optional
+import logging
+from datetime import datetime
+
+class AdvancedMonitoring:
+    """Production-grade monitoring system"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        
+        # Prometheus metrics
+        self.request_counter = Counter(
+            'aegis_requests_total', 
+            'Total requests', 
+            ['method', 'endpoint', 'status']
+        )
+        
+        self.request_duration = Histogram(
+            'aegis_request_duration_seconds',
+            'Request duration',
+            ['method', 'endpoint']
+        )
+        
+        self.prediction_latency = Histogram(
+            'aegis_prediction_latency_seconds',
+            'Prediction latency',
+            ['model_type', 'modality']
+        )
+        
+        self.error_counter = Counter(
+            'aegis_errors_total',
+            'Total errors',
+            ['error_type', 'endpoint']
+        )
+        
+        self.model_memory_usage = Gauge(
+            'aegis_model_memory_bytes',
+            'Model memory usage',
+            ['model_name']
+        )
+        
+        self.gpu_utilization = Gauge(
+            'aegis_gpu_utilization_percent',
+            'GPU utilization',
+            ['gpu_id']
+        )
+        
+        self.cache_hit_ratio = Gauge(
+            'aegis_cache_hit_ratio',
+            'Cache hit ratio'
+        )
+        
+        # Performance metrics
+        self.metrics = {}
+        
+    def track_request(self, method: str, endpoint: str, status: int, duration: float):
+        """Track HTTP request"""
+        self.request_counter.labels(method=method, endpoint=endpoint, status=status).inc()
+        self.request_duration.labels(method=method, endpoint=endpoint).observe(duration)
+    
+    def track_prediction(self, model_type: str, modality: str, latency: float, success: bool = True):
+        """Track prediction metrics"""
+        self.prediction_latency.labels(model_type=model_type, modality=modality).observe(latency)
+        
+        if not success:
+            self.error_counter.labels(error_type='prediction', endpoint='predict').inc()
+    
+    def track_model_memory(self, model_name: str, memory_bytes: int):
+        """Track model memory usage"""
+        self.model_memory_usage.labels(model_name=model_name).set(memory_bytes)
+    
+    def track_gpu_usage(self, gpu_id: int, utilization: float, memory_used: int, memory_total: int):
+        """Track GPU usage"""
+        self.gpu_utilization.labels(gpu_id=str(gpu_id)).set(utilization)
+    
+    def track_cache_metrics(self, hits: int, misses: int):
+        """Track cache performance"""
+        total = hits + misses
+        ratio = hits / total if total > 0 else 0
+        self.cache_hit_ratio.set(ratio)
+    
+    def create_performance_report(self) -> Dict:
+        """Create comprehensive performance report"""
+        return {
+            'timestamp': datetime.now().isoformat(),
+            'metrics': {
+                'request_rate': self._calculate_request_rate(),
+                'average_latency': self._calculate_average_latency(),
+                'error_rate': self._calculate_error_rate(),
+                'resource_utilization': self._get_resource_utilization(),
+                'cache_performance': self._get_cache_performance()
+            },
+            'recommendations': self._generate_recommendations()
+        }
+    
+    def _calculate_request_rate(self) -> float:
+        """Calculate requests per second"""
+        # Implementation would use time-windowed counting
+        return 0.0
+    
+    def _calculate_average_latency(self) -> float:
+        """Calculate average latency"""
+        # Implementation would aggregate latency metrics
+        return 0.0
+    
+    def _calculate_error_rate(self) -> float:
+        """Calculate error rate"""
+        # Implementation would calculate error percentage
+        return 0.0
+    
+    def _get_resource_utilization(self) -> Dict:
+        """Get resource utilization metrics"""
+        return {
+            'gpu_utilization': self._get_gpu_metrics(),
+            'memory_usage': self._get_memory_metrics(),
+            'cpu_usage': self._get_cpu_metrics()
+        }
+    
+    def _get_cache_performance(self) -> Dict:
+        """Get cache performance metrics"""
+        return {
+            'hit_ratio': self.cache_hit_ratio._value.get() if hasattr(self.cache_hit_ratio, '_value') else 0,
+            'size': 0  # Would track actual cache size
+        }
+    
+    def _generate_recommendations(self) -> List[str]:
+        """Generate performance recommendations"""
+        recommendations = []
+        
+        # Example recommendations based on metrics
+        if self.cache_hit_ratio._value.get() < 0.6:
+            recommendations.append("Consider increasing cache size or optimizing cache strategy")
+        
+        # Add more recommendations based on other metrics
+        return recommendations
+    
+    def setup_alerting(self, alert_rules: Dict):
+        """Setup alerting rules"""
+        self.alert_rules = alert_rules
+        
+    def check_alerts(self) -> List[Dict]:
+        """Check for alert conditions"""
+        alerts = []
+        
+        for rule_name, rule in self.alert_rules.items():
+            if self._evaluate_alert_rule(rule):
+                alerts.append({
+                    'name': rule_name,
+                    'severity': rule.get('severity', 'warning'),
+                    'message': rule.get('message', 'Alert triggered'),
+                    'timestamp': datetime.now().isoformat()
+                })
+        
+        return alerts
+    
+    def _evaluate_alert_rule(self, rule: Dict) -> bool:
+        """Evaluate an alert rule"""
+        # Implementation would check metrics against thresholds
+        return False
+
+        from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+import logging
+
+class DistributedTracing:
+    """Distributed tracing setup for Aegis"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.tracer_provider = None
+        
+    def setup_tracing(self, service_name: str = "aegis-api"):
+        """Setup distributed tracing"""
+        try:
+            # Create tracer provider
+            resource = Resource.create({
+                "service.name": service_name,
+                "service.version": "1.0.0"
+            })
+            
+            self.tracer_provider = TracerProvider(resource=resource)
+            
+            # Configure exporter
+            jaeger_exporter = JaegerExporter(
+                agent_host_name=self.config.get('jaeger_host', 'localhost'),
+                agent_port=self.config.get('jaeger_port', 6831),
+            )
+            
+            # Add span processor
+            span_processor = BatchSpanProcessor(jaeger_exporter)
+            self.tracer_provider.add_span_processor(span_processor)
+            
+            # Set the tracer provider
+            trace.set_tracer_provider(self.tracer_provider)
+            
+            # Instrument frameworks
+            FastAPIInstrumentor().instrument()
+            RequestsInstrumentor().instrument()
+            
+            logging.info("Distributed tracing enabled")
+            
+        except Exception as e:
+            logging.warning(f"Failed to setup tracing: {e}")
+    
+    def get_tracer(self, name: str):
+        """Get a tracer instance"""
+        if self.tracer_provider:
+            return trace.get_tracer(name)
+        return trace.get_tracer(__name__)
+    
+    def create_span(self, name: str, attributes: Dict = None):
+        """Create a span for tracing"""
+        tracer = self.get_tracer(__name__)
+        with tracer.start_as_current_span(name) as span:
+            if attributes and span.is_recording():
+                for key, value in attributes.items():
+                    span.set_attribute(key, value)
+            return span
+
+            import numpy as np
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import confusion_matrix, classification_report
+import torch
+from typing import Dict, List, Any, Optional
+from datetime import datetime
+import json
+from pathlib import Path
+
+class AdvancedEvaluator:
+    """Production-grade evaluation system"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.results = {}
+        self.benchmarks = self._load_benchmarks()
+        
+    def _load_benchmarks(self) -> Dict:
+        """Load benchmark datasets and metrics"""
+        return {
+            'multimodal_sentiment': {
+                'datasets': ['CMU-MOSEI', 'MOSI', 'UR-FUNNY'],
+                'metrics': ['accuracy', 'f1_score', 'mae', 'correlation']
+            },
+            'visual_question_answering': {
+                'datasets': ['VQA-v2', 'GQA', 'Visual7W'],
+                'metrics': ['accuracy', 'wups', 'bleu']
+            },
+            'multimodal_classification': {
+                'datasets': ['MM-IMDb', 'Twitter2017', 'HatefulMemes'],
+                'metrics': ['accuracy', 'precision', 'recall', 'f1_score']
+            }
+        }
+    
+    def run_comprehensive_evaluation(self, model, dataloaders: Dict) -> Dict[str, Any]:
+        """Run comprehensive evaluation across all benchmarks"""
+        results = {}
+        
+        for benchmark_name, benchmark_info in self.benchmarks.items():
+            benchmark_results = {}
+            
+            for dataset_name in benchmark_info['datasets']:
+                if dataset_name in dataloaders:
+                    dataset_results = self.evaluate_on_dataset(
+                        model, dataloaders[dataset_name], benchmark_name
+                    )
+                    benchmark_results[dataset_name] = dataset_results
+            
+            results[benchmark_name] = benchmark_results
+        
+        # Generate overall report
+        report = self.generate_evaluation_report(results)
+        
+        # Save results
+        self.save_results(results, report)
+        
+        return {'results': results, 'report': report}
+    
+    def evaluate_on_dataset(self, model, dataloader, task_type: str) -> Dict[str, Any]:
+        """Evaluate model on a specific dataset"""
+        model.eval()
+        all_predictions = []
+        all_targets = []
+        all_metrics = {}
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                outputs = model(batch['inputs'])
+                predictions = self._get_predictions(outputs, task_type)
+                
+                all_predictions.extend(predictions)
+                all_targets.extend(batch['labels'].cpu().numpy())
+        
+        # Calculate metrics based on task type
+        if task_type == 'multimodal_sentiment':
+            all_metrics = self._calculate_regression_metrics(all_predictions, all_targets)
+        else:
+            all_metrics = self._calculate_classification_metrics(all_predictions, all_targets)
+        
+        return {
+            'metrics': all_metrics,
+            'predictions': all_predictions[:100],  # Sample of predictions
+            'targets': all_targets[:100],          # Sample of targets
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    def _calculate_classification_metrics(self, predictions, targets) -> Dict[str, float]:
+        """Calculate classification metrics"""
+        return {
+            'accuracy': accuracy_score(targets, predictions),
+            'f1_score': f1_score(targets, predictions, average='weighted'),
+            'precision': precision_score(targets, predictions, average='weighted'),
+            'recall': recall_score(targets, predictions, average='weighted'),
+            'confusion_matrix': confusion_matrix(targets, predictions).tolist()
+        }
+    
+    def _calculate_regression_metrics(self, predictions, targets) -> Dict[str, float]:
+        """Calculate regression metrics"""
+        predictions = np.array(predictions)
+        targets = np.array(targets)
+        
+        mae = np.mean(np.abs(predictions - targets))
+        mse = np.mean((predictions - targets) ** 2)
+        rmse = np.sqrt(mse)
+        correlation = np.corrcoef(predictions, targets)[0, 1]
+        
+        return {
+            'mae': float(mae),
+            'mse': float(mse),
+            'rmse': float(rmse),
+            'correlation': float(correlation)
+        }
+    
+    def generate_evaluation_report(self, results: Dict) -> Dict[str, Any]:
+        """Generate comprehensive evaluation report"""
+        report = {
+            'summary': {},
+            'detailed_results': results,
+            'performance_benchmarks': self._calculate_benchmarks(results),
+            'recommendations': self._generate_recommendations(results),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return report
+    
+    def _calculate_benchmarks(self, results: Dict) -> Dict[str, Any]:
+        """Calculate performance benchmarks"""
+        benchmarks = {}
+        
+        for benchmark_name, benchmark_results in results.items():
+            benchmark_metrics = {}
+            
+            for dataset_name, dataset_results in benchmark_results.items():
+                for metric_name, metric_value in dataset_results['metrics'].items():
+                    if metric_name not in benchmark_metrics:
+                        benchmark_metrics[metric_name] = []
+                    benchmark_metrics[metric_name].append(metric_value)
+            
+            # Calculate averages
+            averages = {}
+            for metric_name, values in benchmark_metrics.items():
+                if isinstance(values[0], (int, float)):
+                    averages[metric_name] = np.mean(values)
+            
+            benchmarks[benchmark_name] = averages
+        
+        return benchmarks
+    
+    def _generate_recommendations(self, results: Dict) -> List[str]:
+        """Generate improvement recommendations"""
+        recommendations = []
+        
+        # Example recommendations based on results
+        for benchmark_name, benchmark_results in results.items():
+            for dataset_name, dataset_results in benchmark_results.items():
+                metrics = dataset_results['metrics']
+                
+                if 'accuracy' in metrics and metrics['accuracy'] < 0.7:
+                    recommendations.append(
+                        f"Improve accuracy on {dataset_name} (current: {metrics['accuracy']:.3f})"
+                    )
+                
+                if 'f1_score' in metrics and metrics['f1_score'] < 0.6:
+                    recommendations.append(
+                        f"Address class imbalance on {dataset_name} (F1: {metrics['f1_score']:.3f})"
+                    )
+        
+        return recommendations
+    
+    def save_results(self, results: Dict, report: Dict, path: str = "evaluation_results"):
+        """Save evaluation results"""
+        results_dir = Path(path)
+        results_dir.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save detailed results
+        with open(results_dir / f"detailed_results_{timestamp}.json", 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        # Save summary report
+        with open(results_dir / f"summary_report_{timestamp}.json", 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        # Save metrics history
+        self._update_metrics_history(results, timestamp)
+    
+    def _update_metrics_history(self, results: Dict, timestamp: str):
+        """Update metrics history for tracking improvements"""
+        history_file = Path("evaluation_results/metrics_history.json")
+        
+        if history_file.exists():
+            with open(history_file, 'r') as f:
+                history = json.load(f)
+        else:
+            history = {}
+        
+        history[timestamp] = results
+       
+
+
 
