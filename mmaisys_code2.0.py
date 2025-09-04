@@ -9906,4 +9906,71 @@ def report(pipeline_id: str):
 if __name__ == '__main__':
     cli()
 
+import docker
+from typing import List, Dict
+from ..utils.error_handling import error_handler_decorator
+
+class DockerManager:
+    """Docker management utilities for CI/CD"""
+    
+    def __init__(self):
+        self.client = docker.from_env()
+    
+    @error_handler_decorator(context="docker", severity="ERROR")
+    def build_image(self, dockerfile_path: str, tags: List[str], build_args: Dict = None) -> Dict:
+        """Build Docker image with comprehensive logging"""
+        build_args = build_args or {}
+        
+        image, logs = self.client.images.build(
+            path=".",
+            dockerfile=dockerfile_path,
+            tags=tags,
+            buildargs=build_args,
+            rm=True,
+            pull=True,
+            forcerm=True
+        )
+        
+        return {
+            'image_id': image.id,
+            'tags': tags,
+            'logs': list(logs),
+            'size_mb': self._get_image_size(image) / (1024 * 1024)
+        }
+    
+    @error_handler_decorator(context="docker", severity="ERROR")
+    def push_image(self, image_tag: str) -> Dict:
+        """Push Docker image to registry"""
+        image = self.client.images.get(image_tag)
+        push_logs = self.client.images.push(image_tag, stream=True, decode=True)
+        
+        logs = []
+        for log in push_logs:
+            logs.append(log)
+            if 'error' in log:
+                raise docker.errors.BuildError(log['error'])
+        
+        return {
+            'image_tag': image_tag,
+            'logs': logs,
+            'success': True
+        }
+    
+    @error_handler_decorator(context="docker", severity="WARNING")
+    def cleanup_images(self, keep_last: int = 5) -> Dict:
+        """Clean up old Docker images"""
+        images = self.client.images.list()
+        images.sort(key=lambda x: x.attrs['Created'], reverse=True)
+        
+        removed = []
+        for image in images[keep_last:]:
+            try:
+                self.client.images.remove(image.id, force=True)
+                removed.append(image.id)
+            except docker.errors.APIError as e:
+                logger.warning(f"Failed to remove image {image.id}: {e}")
+        
+        return {
+            'removed_count':
+
 
