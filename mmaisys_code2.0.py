@@ -9352,4 +9352,558 @@ class TestProductionFeatures:
             dashboard.trigger_alert("Test alert")
             mock_alert.assert_called_once()
 
+import os
+import sys
+import asyncio
+import aiohttp
+import logging
+from typing import Dict, List, Optional, Any
+from pathlib import Path
+from datetime import datetime
+import docker
+from github import Github, Auth
+import json
+import yaml
+from dataclasses import dataclass
+from enum import Enum
+import subprocess
+from ..utils.error_handling import error_handler_decorator, CircuitBreaker
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class PipelineStage(Enum):
+    TEST = "test"
+    BUILD = "build"
+    DEPLOY_STAGING = "deploy_staging"
+    DEPLOY_PRODUCTION = "deploy_production"
+    MONITOR = "monitor"
+
+class DeploymentStrategy(Enum):
+    BLUE_GREEN = "blue_green"
+    CANARY = "canary"
+    ROLLING = "rolling"
+
+@dataclass
+class PipelineConfig:
+    name: str
+    stages: List[PipelineStage]
+    deployment_strategy: DeploymentStrategy
+    environment: Dict[str, str]
+    timeout_minutes: int = 30
+    max_retries: int = 3
+
+class PythonCICDOrchestrator:
+    """Python-based CI/CD orchestration system for Aegis"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.docker_client = docker.from_env()
+        self.github_client = self._setup_github_client()
+        self.circuit_breaker = CircuitBreaker("cicd_orchestrator", max_failures=5)
+        self.pipeline_history = []
+        
+    def _setup_github_client(self):
+        """Setup GitHub client"""
+        try:
+            auth = Auth.Token(self.config.get('github_token'))
+            return Github(auth=auth)
+        except Exception as e:
+            logger.warning(f"GitHub client setup failed: {e}")
+            return None
+    
+    @error_handler_decorator(context="cicd", severity="ERROR", max_retries=3)
+    async def run_pipeline(self, pipeline_config: PipelineConfig, git_ref: str = "main"):
+        """Execute complete CI/CD pipeline"""
+        pipeline_id = f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        try:
+            self.circuit_breaker.execute(self._validate_pipeline_config, pipeline_config)
+            
+            pipeline_result = {
+                'id': pipeline_id,
+                'start_time': datetime.now().isoformat(),
+                'config': pipeline_config.__dict__,
+                'stages': {},
+                'status': 'running'
+            }
+            
+            # Execute each stage
+            for stage in pipeline_config.stages:
+                stage_result = await self._execute_stage(stage, pipeline_config, git_ref)
+                pipeline_result['stages'][stage.value] = stage_result
+                
+                if not stage_result['success']:
+                    pipeline_result['status'] = 'failed'
+                    pipeline_result['error'] = stage_result['error']
+                    break
+            
+            if pipeline_result['status'] == 'running':
+                pipeline_result['status'] = 'success'
+                pipeline_result['end_time'] = datetime.now().isoformat()
+            
+            self.pipeline_history.append(pipeline_result)
+            return pipeline_result
+            
+        except Exception as e:
+            error_result = {
+                'id': pipeline_id,
+                'status': 'failed',
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
+            self.pipeline_history.append(error_result)
+            return error_result
+    
+    async def _execute_stage(self, stage: PipelineStage, config: PipelineConfig, git_ref: str) -> Dict[str, Any]:
+        """Execute a specific pipeline stage"""
+        stage_methods = {
+            PipelineStage.TEST: self._run_tests,
+            PipelineStage.BUILD: self._build_docker_image,
+            PipelineStage.DEPLOY_STAGING: lambda: self._deploy_environment('staging', config),
+            PipelineStage.DEPLOY_PRODUCTION: lambda: self._deploy_environment('production', config),
+            PipelineStage.MONITOR: self._monitor_deployment
+        }
+        
+        method = stage_methods.get(stage)
+        if not method:
+            return {'success': False, 'error': f'Unknown stage: {stage}'}
+        
+        try:
+            result = await method()
+            return {'success': True, 'result': result}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    async def _run_tests(self) -> Dict[str, Any]:
+        """Run comprehensive test suite"""
+        test_commands = [
+            ["pytest", "tests/", "-v", "--cov=aegis", "--cov-report=xml"],
+            ["python", "-m", "mypy", "aegis/", "--ignore-missing-imports"],
+            ["python", "-m", "flake8", "aegis/", "--max-line-length=120"],
+            ["safety", "check", "--full-report"]
+        ]
+        
+        results = {}
+        for cmd in test_commands:
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                results[cmd[0]] = {
+                    'returncode': result.returncode,
+                    'stdout': result.stdout,
+                    'stderr': result.stderr
+                }
+            except subprocess.TimeoutExpired:
+                results[cmd[0]] = {'error': 'Timeout expired'}
+        
+        # Check if any tests failed
+        all_passed = all(result.get('returncode', 1) == 0 for result in results.values())
+        
+        return {
+            'all_tests_passed': all_passed,
+            'detailed_results': results
+        }
+    
+    async def _build_docker_image(self) -> Dict[str, Any]:
+        """Build and tag Docker image"""
+        try:
+            image_name = self.config.get('docker_image', 'aegis-multimodal')
+            version_tag = f"{image_name}:{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            latest_tag = f"{image_name}:latest"
+            
+            # Build image
+            image, build_logs = self.docker_client.images.build(
+                path=".",
+                dockerfile="deployment/Dockerfile",
+                tag=version_tag,
+                rm=True,
+                pull=True
+            )
+            
+            # Tag as latest
+            image.tag(latest_tag)
+            
+            # Push to registry if configured
+            if self.config.get('docker_registry'):
+                registry_url = self.config['docker_registry']
+                for tag in [version_tag, latest_tag]:
+                    image.tag(f"{registry_url}/{tag}")
+                    push_logs = self.docker_client.images.push(f"{registry_url}/{tag}")
+            
+            return {
+                'image_id': image.id,
+                'tags': [version_tag, latest_tag],
+                'build_logs': build_logs
+            }
+            
+        except docker.errors.BuildError as e:
+            logger.error(f"Docker build failed: {e}")
+            raise
+    
+    async def _deploy_environment(self, environment: str, config: PipelineConfig) -> Dict[str, Any]:
+        """Deploy to specified environment"""
+        deployment_strategy = config.deployment_strategy
+        
+        if deployment_strategy == DeploymentStrategy.BLUE_GREEN:
+            return await self._blue_green_deploy(environment)
+        elif deployment_strategy == DeploymentStrategy.CANARY:
+            return await self._canary_deploy(environment)
+        elif deployment_strategy == DeploymentStrategy.ROLLING:
+            return await self._rolling_deploy(environment)
+        else:
+            raise ValueError(f"Unknown deployment strategy: {deployment_strategy}")
+    
+    async def _blue_green_deploy(self, environment: str) -> Dict[str, Any]:
+        """Blue-green deployment strategy"""
+        # Get current color
+        current_color = await self._get_current_deployment_color(environment)
+        target_color = 'blue' if current_color == 'green' else 'green'
+        
+        # Deploy to target color
+        await self._deploy_to_color(environment, target_color)
+        
+        # Run health checks
+        if not await self._run_health_checks(environment, target_color):
+            raise Exception("Health checks failed for new deployment")
+        
+        # Switch traffic
+        await self._switch_traffic(environment, target_color)
+        
+        # Clean up old deployment
+        await self._cleanup_deployment(environment, current_color)
+        
+        return {
+            'strategy': 'blue_green',
+            'from_color': current_color,
+            'to_color': target_color,
+            'success': True
+        }
+    
+    async def _canary_deploy(self, environment: str) -> Dict[str, Any]:
+        """Canary deployment strategy"""
+        percentages = [10, 25, 50, 75, 100]
+        max_percentage = self.config.get('canary_max_percentage', 50)
+        
+        for percentage in percentages:
+            if percentage > max_percentage:
+                break
+                
+            await self._shift_traffic('canary', percentage)
+            await asyncio.sleep(60)  # Wait 1 minute between increments
+            
+            if not await self._run_health_checks(environment, 'canary'):
+                await self._rollback_canary(environment)
+                raise Exception(f"Health check failed at {percentage}% traffic")
+        
+        # Full rollout
+        await self._switch_traffic(environment, 'canary')
+        return {'strategy': 'canary', 'success': True}
+    
+    async def _rolling_deploy(self, environment: str) -> Dict[str, Any]:
+        """Rolling deployment strategy"""
+        # Implementation would update pods gradually
+        return {'strategy': 'rolling', 'success': True}
+    
+    async def _monitor_deployment(self) -> Dict[str, Any]:
+        """Monitor deployment and run smoke tests"""
+        await asyncio.sleep(300)  # Wait for deployment to stabilize
+        
+        # Run smoke tests
+        smoke_test_results = await self._run_smoke_tests()
+        
+        # Check metrics
+        metrics = await self._check_deployment_metrics()
+        
+        return {
+            'smoke_tests': smoke_test_results,
+            'metrics': metrics,
+            'healthy': smoke_test_results['all_passed'] and metrics['healthy']
+        }
+    
+    async def _run_smoke_tests(self) -> Dict[str, Any]:
+        """Run smoke tests against deployed environment"""
+        endpoints = [
+            "/health",
+            "/ready", 
+            "/v1/models",
+            "/v1/predict"
+        ]
+        
+        results = {}
+        async with aiohttp.ClientSession() as session:
+            for endpoint in endpoints:
+                try:
+                    url = f"{self.config['production_url']}{endpoint}"
+                    async with session.get(url, timeout=10) as response:
+                        results[endpoint] = {
+                            'status': response.status,
+                            'healthy': response.status == 200
+                        }
+                except Exception as e:
+                    results[endpoint] = {'error': str(e), 'healthy': False}
+        
+        all_passed = all(result.get('healthy', False) for result in results.values())
+        return {'endpoints': results, 'all_passed': all_passed}
+    
+    async def _check_deployment_metrics(self) -> Dict[str, Any]:
+        """Check deployment metrics"""
+        # Would integrate with Prometheus API
+        return {'healthy': True, 'metrics_checked': True}
+    
+    # Helper methods for deployment strategies
+    async def _get_current_deployment_color(self, environment: str) -> str:
+        """Get current deployment color"""
+        # Implementation would check current deployment
+        return 'blue'  # Example
+    
+    async def _deploy_to_color(self, environment: str, color: str):
+        """Deploy to specific color"""
+        # Implementation would use kubectl/helm/docker-compose
+        logger.info(f"Deploying to {environment} {color}")
+    
+    async def _run_health_checks(self, environment: str, color: str) -> bool:
+        """Run health checks"""
+        try:
+            url = f"http://{color}.{environment}.example.com/health"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as response:
+                    return response.status == 200
+        except:
+            return False
+    
+    async def _switch_traffic(self, environment: str, target_color: str):
+        """Switch traffic to target color"""
+        logger.info(f"Switching traffic to {target_color} in {environment}")
+    
+    async def _cleanup_deployment(self, environment: str, color: str):
+        """Clean up old deployment"""
+        logger.info(f"Cleaning up {color} in {environment}")
+    
+    async def _shift_traffic(self, target: str, percentage: int):
+        """Shift percentage of traffic"""
+        logger.info(f"Shifting {percentage}% traffic to {target}")
+    
+    async def _rollback_canary(self, environment: str):
+        """Rollback canary deployment"""
+        logger.info(f"Rolling back canary in {environment}")
+    
+    def get_pipeline_history(self, limit: int = 10) -> List[Dict]:
+        """Get pipeline execution history"""
+        return self.pipeline_history[-limit:]
+    
+    def generate_pipeline_report(self, pipeline_id: str) -> Dict[str, Any]:
+        """Generate detailed pipeline report"""
+        pipeline = next((p for p in self.pipeline_history if p['id'] == pipeline_id), None)
+        if not pipeline:
+            return {'error': 'Pipeline not found'}
+        
+        return {
+            'summary': {
+                'id': pipeline['id'],
+                'status': pipeline['status'],
+                'duration': self._calculate_duration(pipeline),
+                'stages_completed': len(pipeline.get('stages', {})),
+                'success_rate': self._calculate_success_rate(pipeline)
+            },
+            'details': pipeline
+        }
+    
+    def _calculate_duration(self, pipeline: Dict) -> Optional[float]:
+        """Calculate pipeline duration"""
+        start = pipeline.get('start_time')
+        end = pipeline.get('end_time')
+        if start and end:
+            start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+            return (end_dt - start_dt).total_seconds()
+        return None
+    
+    def _calculate_success_rate(self, pipeline: Dict) -> float:
+        """Calculate stage success rate"""
+        stages = pipeline.get('stages', {})
+        if not stages:
+            return 0.0
+        
+        successful = sum(1 for stage in stages.values() if stage.get('success'))
+        return successful / len(stages)
+
+📋 Pipeline Configuration (aegis/cicd/config.py)
+python
+
+from typing import Dict, List
+from enum import Enum
+from dataclasses import dataclass
+from .orchestrator import PipelineStage, DeploymentStrategy
+
+@dataclass
+class PipelineTemplate:
+    name: str
+    description: str
+    stages: List[PipelineStage]
+    deployment_strategy: DeploymentStrategy
+    environment_vars: Dict[str, str]
+
+# Pre-defined pipeline templates
+PIPELINE_TEMPLATES = {
+    "full_production": PipelineTemplate(
+        name="Full Production Deployment",
+        description="Complete CI/CD pipeline from test to production",
+        stages=[
+            PipelineStage.TEST,
+            PipelineStage.BUILD,
+            PipelineStage.DEPLOY_STAGING,
+            PipelineStage.DEPLOY_PRODUCTION,
+            PipelineStage.MONITOR
+        ],
+        deployment_strategy=DeploymentStrategy.BLUE_GREEN,
+        environment_vars={
+            "ENVIRONMENT": "production",
+            "LOG_LEVEL": "INFO"
+        }
+    ),
+    
+    "staging_only": PipelineTemplate(
+        name="Staging Deployment",
+        description="Deploy only to staging environment",
+        stages=[
+            PipelineStage.TEST,
+            PipelineStage.BUILD,
+            PipelineStage.DEPLOY_STAGING
+        ],
+        deployment_strategy=DeploymentStrategy.ROLLING,
+        environment_vars={
+            "ENVIRONMENT": "staging",
+            "LOG_LEVEL": "DEBUG"
+        }
+    ),
+    
+    "test_only": PipelineTemplate(
+        name="Test Suite Only",
+        description="Run only tests without deployment",
+        stages=[PipelineStage.TEST],
+        deployment_strategy=DeploymentStrategy.ROLLING,
+        environment_vars={
+            "ENVIRONMENT": "testing",
+            "LOG_LEVEL": "DEBUG"
+        }
+    )
+}
+
+def load_pipeline_config(config_path: str = "cicd_config.yaml") -> Dict:
+    """Load pipeline configuration from YAML file"""
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        return config
+    except FileNotFoundError:
+        # Return default config
+        return {
+            'github_token': os.getenv('GITHUB_TOKEN'),
+            'docker_registry': os.getenv('DOCKER_REGISTRY'),
+            'production_url': os.getenv('PRODUCTION_URL', 'http://localhost:8000'),
+            'slack_webhook': os.getenv('SLACK_WEBHOOK'),
+            'default_template': 'full_production'
+        }
+
+🎯 CLI Interface (aegis/cicd/cli.py)
+python
+
+import click
+import asyncio
+from typing import Optional
+from .orchestrator import PythonCICDOrchestrator, PipelineConfig, PipelineStage, DeploymentStrategy
+from .config import PIPELINE_TEMPLATES, load_pipeline_config
+
+@click.group()
+def cli():
+    """Aegis CI/CD Command Line Interface"""
+    pass
+
+@cli.command()
+@click.option('--template', default='full_production', help='Pipeline template to use')
+@click.option('--ref', default='main', help='Git reference to deploy')
+@click.option('--config', default='cicd_config.yaml', help='Configuration file path')
+def deploy(template: str, ref: str, config: str):
+    """Run deployment pipeline"""
+    async def _deploy():
+        pipeline_config = load_pipeline_config(config)
+        orchestrator = PythonCICDOrchestrator(pipeline_config)
+        
+        template_config = PIPELINE_TEMPLATES.get(template)
+        if not template_config:
+            raise ValueError(f"Unknown template: {template}")
+        
+        pipeline_cfg = PipelineConfig(
+            name=template_config.name,
+            stages=template_config.stages,
+            deployment_strategy=template_config.deployment_strategy,
+            environment=template_config.environment_vars
+        )
+        
+        result = await orchestrator.run_pipeline(pipeline_cfg, ref)
+        
+        if result['status'] == 'success':
+            click.echo(click.style("✅ Deployment successful!", fg='green'))
+        else:
+            click.echo(click.style("❌ Deployment failed!", fg='red'))
+            click.echo(f"Error: {result.get('error', 'Unknown error')}")
+            sys.exit(1)
+    
+    asyncio.run(_deploy())
+
+@cli.command()
+@click.option('--stage', default='test', help='Stage to run (test, build, deploy)')
+def run_stage(stage: str):
+    """Run specific pipeline stage"""
+    async def _run_stage():
+        pipeline_config = load_pipeline_config()
+        orchestrator = PythonCICDOrchestrator(pipeline_config)
+        
+        stage_enum = PipelineStage(stage.lower())
+        result = await orchestrator._execute_stage(stage_enum, None, 'main')
+        
+        if result['success']:
+            click.echo(click.style(f"✅ Stage {stage} completed successfully!", fg='green'))
+        else:
+            click.echo(click.style(f"❌ Stage {stage} failed!", fg='red'))
+            click.echo(f"Error: {result.get('error', 'Unknown error')}")
+    
+    asyncio.run(_run_stage())
+
+@cli.command()
+@click.option('--limit', default=10, help='Number of pipelines to show')
+def history(limit: int):
+    """Show pipeline execution history"""
+    async def _show_history():
+        pipeline_config = load_pipeline_config()
+        orchestrator = PythonCICDOrchestrator(pipeline_config)
+        
+        history = orchestrator.get_pipeline_history(limit)
+        
+        for pipeline in history:
+            status_color = 'green' if pipeline['status'] == 'success' else 'red'
+            click.echo(click.style(
+                f"{pipeline['id']} - {pipeline['status']} - {pipeline.get('timestamp', '')}",
+                fg=status_color
+            ))
+    
+    asyncio.run(_show_history())
+
+@cli.command()
+@click.argument('pipeline_id')
+def report(pipeline_id: str):
+    """Generate detailed pipeline report"""
+    async def _generate_report():
+        pipeline_config = load_pipeline_config()
+        orchestrator = PythonCICDOrchestrator(pipeline_config)
+        
+        report = orchestrator.generate_pipeline_report(pipeline_id)
+        click.echo(json.dumps(report, indent=2))
+    
+    asyncio.run(_generate_report())
+
+if __name__ == '__main__':
+    cli()
+
 
