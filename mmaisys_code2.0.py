@@ -7987,6 +7987,623 @@ class AdvancedEvaluator:
         
         history[timestamp] = results
        
+import secrets
+import hashlib
+import hmac
+from typing import Dict, List, Optional
+from fastapi import HTTPException, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+import logging
+from cryptography.fernet import Fernet
+import jwt
+from datetime import datetime, timedelta
 
+class ProductionSecurity:
+    """Production security hardening for Aegis"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.encryption_key = Fernet.generate_key()
+        self.cipher = Fernet(self.encryption_key)
+        self.jwt_secret = secrets.token_urlsafe(64)
+        
+    async def process_request(self, request: Request):
+        """Process and validate incoming requests"""
+        # Rate limiting
+        if await self._check_rate_limit(request):
+            raise HTTPException(429, "Rate limit exceeded")
+        
+        # Input validation
+        if not await self._validate_input(request):
+            raise HTTPException(400, "Invalid input")
+        
+        # SQL injection prevention
+        if await self._detect_sql_injection(request):
+            raise HTTPException(400, "Suspicious input detected")
+    
+    async def _check_rate_limit(self, request: Request) -> bool:
+        """Advanced rate limiting"""
+        client_ip = get_remote_address(request)
+        endpoint = request.url.path
+        
+        # Implement token bucket algorithm
+        return False  # Would implement actual rate limiting
+    
+    async def _validate_input(self, request: Request) -> bool:
+        """Comprehensive input validation"""
+        try:
+            # Check content type
+            content_type = request.headers.get('content-type', '')
+            if not content_type.startswith('application/json'):
+                return False
+            
+            # Check payload size
+            content_length = int(request.headers.get('content-length', 0))
+            if content_length > self.config.get('max_content_length', 10 * 1024 * 1024):  # 10MB
+                return False
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    async def _detect_sql_injection(self, request: Request) -> bool:
+        """Detect SQL injection attempts"""
+        sql_keywords = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'DROP', 'UNION', 'OR', '1=1']
+        
+        # Check query parameters
+        for param_name, param_value in request.query_params.items():
+            if any(keyword in param_value.upper() for keyword in sql_keywords):
+                return True
+        
+        # Check JSON body
+        try:
+            body = await request.json()
+            for key, value in body.items():
+                if isinstance(value, str) and any(keyword in value.upper() for keyword in sql_keywords):
+                    return True
+        except:
+            pass
+        
+        return False
+    
+    def encrypt_sensitive_data(self, data: str) -> str:
+        """Encrypt sensitive data"""
+        return self.cipher.encrypt(data.encode()).decode()
+    
+    def decrypt_sensitive_data(self, encrypted_data: str) -> str:
+        """Decrypt sensitive data"""
+        return self.cipher.decrypt(encrypted_data.encode()).decode()
+    
+    def generate_jwt_token(self, payload: Dict, expires_minutes: int = 60) -> str:
+        """Generate JWT token"""
+        payload['exp'] = datetime.utcnow() + timedelta(minutes=expires_minutes)
+        return jwt.encode(payload, self.jwt_secret, algorithm='HS256')
+    
+    def verify_jwt_token(self, token: str) -> Dict:
+        """Verify JWT token"""
+        try:
+            return jwt.decode(token, self.jwt_secret, algorithms=['HS256'])
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(401, "Token expired")
+        except jwt.InvalidTokenError:
+            raise HTTPException(401, "Invalid token")
+    
+    def validate_file_upload(self, file_content: bytes, filename: str) -> bool:
+        """Validate file uploads for security"""
+        # Check file type
+        allowed_extensions = {'.jpg', '.jpeg', '.png', '.txt', '.pdf', '.wav', '.mp3'}
+        if not any(filename.lower().endswith(ext) for ext in allowed_extensions):
+            return False
+        
+        # Check file size
+        if len(file_content) > self.config.get('max_file_size', 50 * 1024 * 1024):  # 50MB
+            return False
+        
+        # Check for malicious patterns
+        malicious_patterns = [
+            b'<?php', b'<script', b'eval(', b'exec(', b'system('
+        ]
+        
+        if any(pattern in file_content for pattern in malicious_patterns):
+            return False
+        
+        return True
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+from datetime import datetime
+import hashlib
+import shutil
+from dataclasses import dataclass
+from enum import Enum
+
+class ModelStatus(Enum):
+    DEVELOPMENT = "development"
+    STAGING = "staging"
+    PRODUCTION = "production"
+    DEPRECATED = "deprecated"
+
+@dataclass
+class ModelVersion:
+    name: str
+    version: str
+    path: str
+    status: ModelStatus
+    metrics: Dict
+    created_at: datetime
+    description: str = ""
+
+class ProductionModelRegistry:
+    """Enterprise-grade model registry"""
+    
+    def __init__(self, registry_path: str = "models/registry"):
+        self.registry_path = Path(registry_path)
+        self.registry_path.mkdir(parents=True, exist_ok=True)
+        self.versions = self._load_registry()
+    
+    def _load_registry(self) -> Dict[str, List[ModelVersion]]:
+        """Load model registry from disk"""
+        registry_file = self.registry_path / "registry.json"
+        if registry_file.exists():
+            with open(registry_file, 'r') as f:
+                data = json.load(f)
+                return {
+                    model_name: [ModelVersion(**v) for v in versions]
+                    for model_name, versions in data.items()
+                }
+        return {}
+    
+    def _save_registry(self):
+        """Save registry to disk"""
+        registry_file = self.registry_path / "registry.json"
+        data = {
+            model_name: [vars(v) for v in versions]
+            for model_name, versions in self.versions.items()
+        }
+        with open(registry_file, 'w') as f:
+            json.dump(data, f, indent=2, default=str)
+    
+    def register_model(self, model_name: str, model_path: str, 
+                      metrics: Dict, description: str = "") -> str:
+        """Register a new model version"""
+        version_id = self._generate_version_id()
+        
+        # Create version directory
+        version_path = self.registry_path / model_name / version_id
+        version_path.mkdir(parents=True, exist_ok=True)
+        
+        # Copy model files
+        model_files = list(Path(model_path).glob("*"))
+        for file_path in model_files:
+            if file_path.is_file():
+                shutil.copy2(file_path, version_path / file_path.name)
+        
+        # Create model version
+        model_version = ModelVersion(
+            name=model_name,
+            version=version_id,
+            path=str(version_path),
+            status=ModelStatus.DEVELOPMENT,
+            metrics=metrics,
+            created_at=datetime.now(),
+            description=description
+        )
+        
+        # Add to registry
+        if model_name not in self.versions:
+            self.versions[model_name] = []
+        self.versions[model_name].append(model_version)
+        
+        self._save_registry()
+        return version_id
+    
+    def promote_model(self, model_name: str, version: str, 
+                     target_status: ModelStatus) -> bool:
+        """Promote model to different status"""
+        if model_name not in self.versions:
+            return False
+        
+        for model_version in self.versions[model_name]:
+            if model_version.version == version:
+                model_version.status = target_status
+                self._save_registry()
+                return True
+        
+        return False
+    
+    def get_production_model(self, model_name: str) -> Optional[ModelVersion]:
+        """Get current production model"""
+        if model_name not in self.versions:
+            return None
+        
+        production_models = [
+            v for v in self.versions[model_name] 
+            if v.status == ModelStatus.PRODUCTION
+        ]
+        
+        if production_models:
+            return sorted(production_models, key=lambda x: x.created_at, reverse=True)[0]
+        return None
+    
+    def rollback_model(self, model_name: str) -> bool:
+        """Rollback to previous production version"""
+        if model_name not in self.versions:
+            return False
+        
+        production_versions = [
+            v for v in self.versions[model_name] 
+            if v.status == ModelStatus.PRODUCTION
+        ]
+        
+        if len(production_versions) < 2:
+            return False
+        
+        # Sort by creation date and get second most recent
+        production_versions.sort(key=lambda x: x.created_at, reverse=True)
+        previous_version = production_versions[1]
+        
+        # Demote current, promote previous
+        production_versions[0].status = ModelStatus.STAGING
+        previous_version.status = ModelStatus.PRODUCTION
+        
+        self._save_registry()
+        return True
+    
+    def _generate_version_id(self) -> str:
+        """Generate unique version ID"""
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        random_suffix = hashlib.md5(secrets.token_bytes(8)).hexdigest()[:6]
+        return f"v{timestamp}_{random_suffix}"
+    
+    def get_model_stats(self, model_name: str) -> Dict:
+        """Get statistics for a model"""
+        if model_name not in self.versions:
+            return {}
+        
+        versions = self.versions[model_name]
+        return {
+            'total_versions': len(versions),
+            'production_versions': len([v for v in versions if v.status == ModelStatus.PRODUCTION]),
+            'latest_version': versions[-1].version if versions else None,
+            'performance_trend': self._calculate_performance_trend(versions)
+        }
+    
+    def _calculate_performance_trend(self, versions: List[ModelVersion]) -> Dict:
+        """Calculate performance trend across versions"""
+        # Implementation would analyze metrics over time
+        return {}
+
+
+python
+
+import redis
+from typing import Dict, Any, Optional
+import json
+import zlib
+from datetime import datetime, timedelta
+import hashlib
+
+class AdvancedCache:
+    """Production-grade caching with Redis and optimization"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.redis_client = self._setup_redis()
+        self.local_cache = {}  # In-memory cache for frequent access
+        self.cache_stats = {
+            'hits': 0,
+            'misses': 0,
+            'size': 0,
+            'avg_load_time': 0
+        }
+    
+    def _setup_redis(self) -> Optional[redis.Redis]:
+        """Setup Redis connection"""
+        try:
+            return redis.Redis(
+                host=self.config.get('redis_host', 'localhost'),
+                port=self.config.get('redis_port', 6379),
+                db=self.config.get('redis_db', 0),
+                password=self.config.get('redis_password'),
+                decode_responses=False
+            )
+        except Exception as e:
+            logging.warning(f"Redis connection failed: {e}")
+            return None
+    
+    def get(self, key: str, use_local: bool = True) -> Optional[Any]:
+        """Get value from cache with multiple layers"""
+        start_time = datetime.now()
+        
+        # First try local cache
+        if use_local and key in self.local_cache:
+            entry = self.local_cache[key]
+            if datetime.now() < entry['expiry']:
+                self.cache_stats['hits'] += 1
+                self._update_stats(datetime.now() - start_time)
+                return entry['value']
+        
+        # Then try Redis
+        if self.redis_client:
+            try:
+                compressed_data = self.redis_client.get(f"aegis:{key}")
+                if compressed_data:
+                    data = zlib.decompress(compressed_data)
+                    value = json.loads(data.decode())
+                    
+                    # Update local cache
+                    self.local_cache[key] = {
+                        'value': value,
+                        'expiry': datetime.now() + timedelta(seconds=300)  # 5 minutes
+                    }
+                    
+                    self.cache_stats['hits'] += 1
+                    self._update_stats(datetime.now() - start_time)
+                    return value
+            except Exception as e:
+                logging.warning(f"Redis get failed: {e}")
+        
+        self.cache_stats['misses'] += 1
+        self._update_stats(datetime.now() - start_time)
+        return None
+    
+    def set(self, key: str, value: Any, ttl: int = 3600, 
+           use_local: bool = True) -> bool:
+        """Set value in cache with multiple layers"""
+        try:
+            # Set in local cache
+            if use_local:
+                self.local_cache[key] = {
+                    'value': value,
+                    'expiry': datetime.now() + timedelta(seconds=min(300, ttl))
+                }
+            
+            # Set in Redis
+            if self.redis_client:
+                data = json.dumps(value).encode()
+                compressed_data = zlib.compress(data)
+                return self.redis_client.setex(
+                    f"aegis:{key}", 
+                    ttl, 
+                    compressed_data
+                )
+            
+            return True
+            
+        except Exception as e:
+            logging.warning(f"Cache set failed: {e}")
+            return False
+    
+    def memoize(self, func=None, ttl: int = 3600, key_prefix: str = ""):
+        """Decorator for automatic function result caching"""
+        def decorator(f):
+            def wrapper(*args, **kwargs):
+                # Generate cache key from function arguments
+                cache_key = self._generate_cache_key(f, args, kwargs, key_prefix)
+                
+                # Try to get from cache
+                cached_result = self.get(cache_key)
+                if cached_result is not None:
+                    return cached_result
+                
+                # Compute and cache result
+                result = f(*args, **kwargs)
+                self.set(cache_key, result, ttl)
+                return result
+            return wrapper
+        return decorator(func) if func else decorator
+    
+    def _generate_cache_key(self, func, args, kwargs, prefix: str) -> str:
+        """Generate cache key from function signature"""
+        args_str = str(args) + str(sorted(kwargs.items()))
+        key_data = f"{func.__module__}.{func.__name__}:{args_str}"
+        if prefix:
+            key_data = f"{prefix}:{key_data}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+    
+    def _update_stats(self, load_time: timedelta):
+        """Update cache statistics"""
+        self.cache_stats['avg_load_time'] = (
+            self.cache_stats['avg_load_time'] * 0.9 + 
+            load_time.total_seconds() * 0.1
+        )
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        hit_ratio = (self.cache_stats['hits'] / 
+                    (self.cache_stats['hits'] + self.cache_stats['misses']) 
+                    if (self.cache_stats['hits'] + self.cache_stats['misses']) > 0 else 0)
+        
+        return {
+            **self.cache_stats,
+            'hit_ratio': hit_ratio,
+            'local_cache_size': len(self.local_cache),
+            'redis_connected': self.redis_client is not None
+        }
+    
+    def clear_pattern(self, pattern: str) -> int:
+        """Clear cache entries matching pattern"""
+        cleared = 0
+        if self.redis_client:
+            try:
+                keys = self.redis_client.keys(f"aegis:{pattern}*")
+                if keys:
+                    cleared = self.redis_client.delete(*keys)
+            except Exception as e:
+                logging.warning(f"Pattern clear failed: {e}")
+        
+        # Clear local cache
+        local_keys = [k for k in self.local_cache.keys() if k.startswith(pattern)]
+        for key in local_keys:
+            del self.local_cache[key]
+            cleared += 1
+        
+        return cleared
+
+
+python
+
+import requests
+import time
+from typing import Dict, List, Optional
+from threading import Thread
+from datetime import datetime
+
+class BlueGreenDeployer:
+    """Blue-green deployment system for zero downtime"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.current_color = 'blue'  # or 'green'
+        self.deployment_history = []
+    
+    def deploy_new_version(self, version: str, 
+                          health_check_endpoint: str = "/health") -> bool:
+        """Deploy new version using blue-green strategy"""
+        deployment_id = f"deploy_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        try:
+            # 1. Deploy to inactive environment
+            target_color = 'green' if self.current_color == 'blue' else 'blue'
+            self._deploy_to_environment(target_color, version)
+            
+            # 2. Run health checks
+            if not self._run_health_checks(target_color, health_check_endpoint):
+                raise Exception("Health checks failed")
+            
+            # 3. Switch traffic
+            self._switch_traffic(target_color)
+            
+            # 4. Update current color
+            old_color = self.current_color
+            self.current_color = target_color
+            
+            # 5. Clean up old environment
+            self._cleanup_environment(old_color)
+            
+            # Record successful deployment
+            self.deployment_history.append({
+                'id': deployment_id,
+                'timestamp': datetime.now().isoformat(),
+                'version': version,
+                'from_color': old_color,
+                'to_color': target_color,
+                'status': 'success'
+            })
+            
+            return True
+            
+        except Exception as e:
+            # Record failed deployment
+            self.deployment_history.append({
+                'id': deployment_id,
+                'timestamp': datetime.now().isoformat(),
+                'version': version,
+                'error': str(e),
+                'status': 'failed'
+            })
+            
+            # Rollback if necessary
+            self._rollback_deployment()
+            return False
+    
+    def _deploy_to_environment(self, color: str, version: str):
+        """Deploy to specific environment"""
+        # Implementation would use your deployment tools
+        # (Kubernetes, Docker, AWS CodeDeploy, etc.)
+        print(f"Deploying version {version} to {color} environment")
+        time.sleep(2)  # Simulate deployment time
+    
+    def _run_health_checks(self, color: str, endpoint: str) -> bool:
+        """Run health checks on deployed environment"""
+        max_attempts = 30
+        check_interval = 5
+        
+        for attempt in range(max_attempts):
+            try:
+                response = requests.get(
+                    f"http://{color}.aegis.example.com{endpoint}",
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    return True
+            except:
+                pass
+            
+            time.sleep(check_interval)
+        
+        return False
+    
+    def _switch_traffic(self, target_color: str):
+        """Switch traffic to target environment"""
+        # Implementation depends on your infrastructure:
+        # - Load balancer DNS update
+        # - Kubernetes service selector update
+        # - API gateway configuration
+        print(f"Switching traffic to {target_color} environment")
+        time.sleep(1)
+    
+    def _cleanup_environment(self, color: str):
+        """Clean up old environment"""
+        print(f"Cleaning up {color} environment")
+        # Would remove old containers, free resources, etc.
+    
+    def _rollback_deployment(self):
+        """Rollback deployment in case of failure"""
+        print("Rolling back deployment")
+        # Implementation would revert to previous known good state
+    
+    def canary_deploy(self, version: str, percentage: int = 10,
+                     health_check_endpoint: str = "/health") -> bool:
+        """Canary deployment with gradual traffic shift"""
+        if percentage <= 0 or percentage > 100:
+            raise ValueError("Percentage must be between 1 and 100")
+        
+        try:
+            # 1. Deploy to canary environment
+            self._deploy_to_environment('canary', version)
+            
+            # 2. Run health checks
+            if not self._run_health_checks('canary', health_check_endpoint):
+                raise Exception("Canary health checks failed")
+            
+            # 3. Gradually shift traffic
+            for percent in range(10, 101, 10):
+                if percent > percentage:
+                    break
+                    
+                self._shift_traffic('canary', percent)
+                time.sleep(60)  # Wait 1 minute between increments
+                
+                # Check health during traffic shift
+                if not self._run_health_checks('canary', health_check_endpoint):
+                    raise Exception(f"Health check failed at {percent}% traffic")
+            
+            # 4. Full rollout
+            self._switch_traffic('canary')
+            self.current_color = 'canary'
+            
+            return True
+            
+        except Exception as e:
+            self._rollback_canary()
+            return False
+    
+    def _shift_traffic(self, environment: str, percentage: int):
+        """Shift percentage of traffic to environment"""
+        print(f"Shifting {percentage}% traffic to {environment}")
+        # Implementation would update load balancer weights
+    
+    def _rollback_canary(self):
+        """Rollback canary deployment"""
+        print("Rolling back canary deployment")
+        self._shift_traffic(self.current_color, 100)  # Back to 100% current
+    
+    def get_deployment_history(self, limit: int = 10) -> List[Dict]:
+        """Get deployment history"""
+        return self.deployment_history[-limit:]
 
 
