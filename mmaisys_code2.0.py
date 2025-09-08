@@ -11164,6 +11164,262 @@ class MigrationManager:
             }
             
         except Exception as e:
+
+        class AutonomousAgent:
+    """Add autonomous goal pursuit capabilities"""
+    
+    def __init__(self):
+        self.goal_manager = GoalManager()
+        self.task_decomposer = TaskDecomposer()
+        self.progress_tracker = ProgressTracker()
+    
+    async def pursue_goal(self, goal_description: str):
+        """Autonomously pursue a goal"""
+        # 1. Understand and validate goal
+        goal = await self.goal_manager.define_goal(goal_description)
+        
+        # 2. Break into sub-tasks
+        tasks = await self.task_decomposer.decompose(goal)
+        
+        # 3. Execute tasks autonomously
+        for task in tasks:
+            result = await self.execute_task(task)
+            await self.progress_tracker.update(goal, task, result)
+            
+            if not result.success:
+                await self.recover_from_failure(task, result)
+        
+        # 4. Deliver final result
+        return await self.compile_results(goal)
+    
+    async def execute_task(self, task: Task) -> TaskResult:
+        """Autonomously execute a single task"""
+        # Choose appropriate tools based on task
+        tools = await self.tool_selector.select_tools(task)
+        
+        # Execute using selected tools
+        for tool in tools:
+            try:
+                result = await tool.execute(task)
+                if result.success:
+                    return result
+            except Exception as e:
+                continue  # Try next tool
+        
+        return TaskResult(success=False, error="All tools failed")
+
+        class ToolManager:
+    """Autonomous tool selection and usage"""
+    
+    def __init__(self):
+        self.tool_registry = self._initialize_tools()
+        self.tool_selector = ToolSelector()
+    
+    def _initialize_tools(self) -> Dict[str, Tool]:
+        """Register all available tools"""
+        return {
+            "web_search": WebSearchTool(),
+            "data_analysis": DataAnalysisTool(),
+            "code_execution": CodeExecutionTool(),
+            "file_operation": FileOperationTool(),
+            "model_training": ModelTrainingTool(),
+            "api_integration": APIIntegrationTool(),
+        }
+    
+    async def select_tool(self, task: Task, context: Dict) -> Tool:
+        """Autonomously select the best tool for the task"""
+        # Analyze task requirements
+        task_requirements = await self.analyze_task_requirements(task)
+        
+        # Evaluate available tools
+        tool_scores = {}
+        for tool_name, tool in self.tool_registry.items():
+            score = await self.evaluate_tool_fitness(tool, task_requirements, context)
+            tool_scores[tool_name] = score
+        
+        # Select best tool
+        best_tool_name = max(tool_scores, key=tool_scores.get)
+        return self.tool_registry[best_tool_name]
+    
+    async def use_tool_autonomously(self, tool: Tool, task: Task) -> ToolResult:
+        """Autonomously use tool with error recovery"""
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                result = await tool.execute(task)
+                if result.success:
+                    return result
+                
+                # If tool failed, try to recover
+                recovery_result = await self.recover_from_tool_failure(tool, result, task)
+                if recovery_result.success:
+                    return recovery_result
+                    
+            except Exception as e:
+                logger.warning(f"Tool {tool.name} failed attempt {attempt + 1}: {e}")
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        
+        return ToolResult(success=False, error="All attempts failed")
+
+        class SelfCorrectingAgent:
+    """Capabilities for self-correction and learning"""
+    
+    def __init__(self):
+        self.error_analyzer = ErrorAnalyzer()
+        self.correction_strategies = CorrectionStrategies()
+        self.learning_memory = LearningMemory()
+    
+    async function detect_and_correct_errors(self, task_result: TaskResult) -> CorrectionResult:
+        """Autonomously detect and correct errors"""
+        # Analyze the error
+        error_analysis = await self.error_analyzer.analyze(task_result.error)
+        
+        # Select correction strategy
+        strategy = await self.select_correction_strategy(error_analysis)
+        
+        # Apply correction
+        correction_result = await strategy.apply(task_result)
+        
+        # Learn from this experience
+        if correction_result.success:
+            await self.learning_memory.store_success(
+                task_result.task, strategy, correction_result
+            )
+        else:
+            await self.learning_memory.store_failure(
+                task_result.task, strategy, correction_result
+            )
+        
+        return correction_result
+    
+    async function learn_from_experience(self):
+        """Autonomously learn from past experiences"""
+        # Analyze success patterns
+        success_patterns = await self.learning_memory.analyze_successes()
+        
+        # Analyze failure patterns
+        failure_patterns = await self.learning_memory.analyze_failures()
+        
+        # Update behavior based on learning
+        await self.update_decision_making(success_patterns, failure_patterns)
+        
+        # Optimize tool selection
+        await self.optimize_tool_selection(success_patterns)
+
+        class PersistentAgentMemory:
+    """Persistent memory for agentic behavior"""
+    
+    def __init__(self):
+        self.goal_memory = GoalMemory()
+        self.experience_memory = ExperienceMemory()
+        self.knowledge_memory = KnowledgeMemory()
+        self.state_manager = AgentStateManager()
+    
+    async function maintain_conversation_state(self, conversation_id: str, state: Dict):
+        """Maintain persistent conversation state"""
+        await self.state_manager.save_state(conversation_id, state)
+    
+    async function recall_conversation_context(self, conversation_id: str) -> Dict:
+        """Recall previous conversation context"""
+        return await self.state_manager.load_state(conversation_id)
+    
+    async function store_learned_knowledge(self, knowledge: Dict):
+        """Store learned knowledge for future use"""
+        await self.knowledge_memory.store(knowledge)
+    
+    async function retrieve_relevant_knowledge(self, task: Task) -> List[Dict]:
+        """Retrieve knowledge relevant to current task"""
+        return await self.knowledge_memory.retrieve(task.description)
+
+        class PlanningAgent:
+    """Multi-step planning and execution capabilities"""
+    
+    def __init__(self):
+        self.planner = TaskPlanner()
+        self.executor = TaskExecutor()
+        self.monitor = ExecutionMonitor()
+    
+    async function create_and_execute_plan(self, goal: Goal) -> PlanResult:
+        """Create and execute multi-step plan autonomously"""
+        # 1. Create initial plan
+        plan = await self.planner.create_plan(goal)
+        
+        # 2. Execute plan with monitoring
+        results = []
+        for step in plan.steps:
+            step_result = await self.executor.execute_step(step)
+            results.append(step_result)
+            
+            # Monitor execution and adapt if needed
+            monitoring_result = await self.monitor.monitor_execution(step_result, plan)
+            
+            if monitoring_result.requires_replanning:
+                new_plan = await self.planner.replan(plan, results, monitoring_result)
+                plan = new_plan
+        
+        # 3. Compile final results
+        return await self.compile_plan_results(plan, results)
+    
+    async function handle_plan_disruptions(self, plan: Plan, disruption: Disruption) -> Plan:
+        """Autonomously handle plan disruptions"""
+        # Analyze disruption impact
+        impact = await self.analyze_disruption_impact(plan, disruption)
+        
+        # Generate recovery strategies
+        strategies = await self.generate_recovery_strategies(impact)
+        
+        # Select and apply best strategy
+        best_strategy = await self.select_recovery_strategy(strategies)
+        recovered_plan = await best_strategy.apply(plan, disruption)
+        
+        return recovered_plan
+
+        class AgenticAegis:
+    """Fully agentic version of Aegis"""
+    
+    def __init__(self, base_aegis: AegisMultimodalModel):
+        self.base_aegis = base_aegis  # Current Aegis capabilities
+        self.autonomous_agent = AutonomousAgent()
+        self.tool_manager = ToolManager()
+        self.self_correction = SelfCorrectingAgent()
+        self.memory = PersistentAgentMemory()
+        self.planner = PlanningAgent()
+    
+    async function run_autonomously(self, user_input: str) -> AutonomousResult:
+        """Run Aegis in fully autonomous mode"""
+        # 1. Understand user intent and set goal
+        goal = await self.understand_user_intent(user_input)
+        
+        # 2. Create and execute plan
+        plan_result = await self.planner.create_and_execute_plan(goal)
+        
+        # 3. Handle any failures autonomously
+        if not plan_result.success:
+            recovery_result = await self.self_correction.detect_and_correct_errors(plan_result)
+            if recovery_result.success:
+                plan_result = recovery_result
+        
+        # 4. Learn from this execution
+        await self.self_correction.learn_from_experience()
+        
+        # 5. Return results with explanation
+        return await self.format_autonomous_result(plan_result)
+    
+    async function understand_user_intent(self, user_input: str) -> Goal:
+        """Understand user intent and create appropriate goal"""
+        # Use Aegis's multimodal understanding
+        understanding = await self.base_aegis.understand(user_input)
+        
+        # Extract goals and constraints
+        goal = await self.extract_goal_from_understanding(understanding)
+        
+        # Validate goal feasibility
+        if await self.validate_goal_feasibility(goal):
+            return goal
+        else:
+            raise ValueError("Goal is not feasible with current capabilities")
+
+            
             logger.error(f"Migration status check failed: {e}")
             return {"error": str(e)}
 
