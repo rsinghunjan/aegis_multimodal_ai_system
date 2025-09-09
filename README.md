@@ -2,10 +2,10 @@
 Aegis is a development framework for a multimodal AI system that I generated using DeepSeek. 
 
 # Aegis Market Positioning
-Only complete open-source multimodal agentic framework
-First privacy-preserving enterprise AI platform
-Only sustainable AI framework with carbon awareness
-Comprehensive production-ready AI system
+* Only complete open-source multimodal agentic framework
+* First privacy-preserving enterprise AI platform
+* Only sustainable AI framework with carbon awareness
+* Comprehensive production-ready AI system
 
 
 
