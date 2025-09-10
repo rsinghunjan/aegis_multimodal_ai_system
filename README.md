@@ -16,6 +16,15 @@ A large langauge model (LLM) that has multimodal capabilities, large context win
 
 A conceptual framework for building a self-hosted, multimodal AI assistant using open-weight models. This is not a single model, but an orchestration system that routes tasks to specialized models for reasoning, vision, and image generation.
 
+# Capabilities
+* Multimodal Agentic
+* Federated Learning
+* Zero-Trust Security
+* Carbon-Aware
+* Self-Hosted
+* Enterprise Ready
+
+
 ## Features
 
 *   **Core Reasoning:** Powered by DeepSeek-V2 or Llama 3.
