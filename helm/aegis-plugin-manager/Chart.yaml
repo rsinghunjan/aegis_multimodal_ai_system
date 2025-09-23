@@ -1,0 +1,6 @@
+apiVersion: v2
+name: aegis-plugin-manager
+description: Aegis Multimodal AI Plugin Manager
+type: application
+version: 1.0.0
+appVersion: "2.0"
