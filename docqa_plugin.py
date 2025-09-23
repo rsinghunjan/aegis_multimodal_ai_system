@@ -1,0 +1,1 @@
+# Content of docqa_plugin.py
