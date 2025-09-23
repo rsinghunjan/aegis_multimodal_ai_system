@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+transformers
+torch
+pillow
+requests
+gradio
+spacy
