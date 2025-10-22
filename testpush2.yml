@@ -1,0 +1,40 @@
+name: Test Push Permission
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with credentials persisted)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create test branch and file
+        run: |
+          set -euo pipefail
+          # Build branch name inside the shell so $(date +%s) is expanded
+          BRANCH_NAME="test/actions-push-$(date +%s)"
+          echo "Creating branch $BRANCH_NAME"
+          git checkout -b "$BRANCH_NAME"
+          echo "This is a test file created by GitHub Actions at $(date -u)" > ACTIONS_TEST_PUSH.txt
+          echo "Repository: $GITHUB_REPOSITORY" >> ACTIONS_TEST_PUSH.txt
+          git add ACTIONS_TEST_PUSH.txt
+          git commit -m "chore: test push from actions (auto)"
+          git push --set-upstream origin "$BRANCH_NAME"
+          echo "::notice::Pushed branch $BRANCH_NAME"
+
+      - name: Show pushed branch remote info
+        run: |
+          git fetch origin
+          git branch -r | grep "test/actions-push-" || true
