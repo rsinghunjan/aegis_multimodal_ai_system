@@ -1,0 +1,260 @@
+name: Auto Apply Quick Wins
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create files for quick-wins
+        run: |
+          set -e
+          BRANCH=enhancement/quick-wins
+          git checkout -b "$BRANCH"
+
+          cat > .github/PULL_REQUEST_TEMPLATE.md <<'EOF'
+## Summary
+
+This PR implements a set of "quick wins" to make the project easier to run, test, and review:
+
+- Add health endpoint, logging and content-length limit middleware.
+- Add basic API key protection for endpoints.
+- Add Dockerfile and CI for running tests.
+- Pin dependencies in requirements.txt.
+- Add unit tests for health and core multimodal helper functions.
+- Provide example auth + rate-limiting middleware and a more complete README.
+EOF
+
+          cat > .dockerignore <<'EOF'
+__pycache__
+*.pyc
+.venv
+.env
+.git
+.gitignore
+Dockerfile
+*.log
+data/
+models/
+node_modules/
+EOF
+
+          mkdir -p aegis_multimodal_ai_system
+          cat > aegis_multimodal_ai_system/README.md <<'EOF'
+# Aegis Multimodal AI System
+
+This repository contains a lightweight multimodal AI orchestration demo with:
+- FastAPI server and a Gradio demo
+- Modular multimodal logic in `multimodal_ai_system.py`
+- Safety checker skeleton
+- Example middleware for auth & rate-limiting
+- CI and tests
+
+Quick start (local)
+
+1. Create and activate a virtual environment (recommended)
+   python -m venv .venv
+   source .venv/bin/activate
+
+2. Install pinned dependencies
+   pip install -r aegis_multimodal_ai_system/requirements.txt
+
+3. Run the API
+   uvicorn aegis_multimodal_ai_system.main:app --reload
+
+4. Health check
+   GET http://localhost:8000/health
+EOF
+
+          mkdir -p aegis_multimodal_ai_system/middleware
+          cat > aegis_multimodal_ai_system/middleware/auth_rate_limit.py <<'EOF'
+# Simple in-memory auth + rate-limiting middleware (demo only).
+import os, time, logging
+from starlette.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+logger = logging.getLogger("aegis.middleware")
+API_KEY = os.getenv("AEGIS_API_KEY", None)
+RATE_LIMIT_WINDOW = int(os.getenv("AEGIS_RATE_LIMIT_WINDOW", 60))
+RATE_LIMIT_REQUESTS = int(os.getenv("AEGIS_RATE_LIMIT_REQUESTS", 30))
+
+class APIKeyAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if path.startswith("/health") or path.startswith("/docs") or path.startswith("/openapi.json"):
+            return await call_next(request)
+        key = request.headers.get("x-api-key") or (request.headers.get("authorization") or "").split("Bearer ")[-1]
+        if not API_KEY:
+            logger.warning("AEGIS_API_KEY not configured; endpoints are not protected.")
+            return await call_next(request)
+        if key != API_KEY:
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+class InMemoryRateLimiter:
+    def __init__(self):
+        self.store = {}
+        self.window = RATE_LIMIT_WINDOW
+        self.limit = RATE_LIMIT_REQUESTS
+
+    def allow_request(self, key: str) -> bool:
+        now = time.monotonic()
+        timestamps = self.store.get(key, [])
+        cutoff = now - self.window
+        timestamps = [ts for ts in timestamps if ts > cutoff]
+        if len(timestamps) >= self.limit:
+            self.store[key] = timestamps
+            return False
+        timestamps.append(now)
+        self.store[key] = timestamps
+        return True
+
+RATE_LIMITER = InMemoryRateLimiter()
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        key = request.headers.get("x-api-key") or (request.headers.get("authorization") or "").split("Bearer ")[-1]
+        if not key:
+            key = request.client.host if request.client else "anonymous"
+        if not RATE_LIMITER.allow_request(key):
+            return JSONResponse({"detail": "Too Many Requests"}, status_code=429)
+        return await call_next(request)
+EOF
+
+          cat > aegis_multimodal_ai_system/requirements.txt <<'EOF'
+fastapi==0.95.2
+uvicorn==0.22.0
+gradio==3.52.0
+pytest==7.3.1
+pytest-asyncio==0.21.0
+httpx==0.24.0
+python-multipart==0.0.6
+EOF
+
+          mkdir -p aegis_multimodal_ai_system/tests
+          cat > aegis_multimodal_ai_system/tests/test_health.py <<'EOF'
+import pytest
+from httpx import AsyncClient
+from aegis_multimodal_ai_system.app import app
+
+@pytest.mark.anyio
+async def test_health():
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        r = await ac.get("/health")
+    assert r.status_code == 200
+    assert r.json().get("status") == "ok"
+EOF
+
+          cat > aegis_multimodal_ai_system/tests/test_multimodal_ai_system.py <<'EOF'
+import pytest
+from aegis_multimodal_ai_system.multimodal_ai_system import MultimodalAISystem
+
+def test_extract_city_from_query(monkeypatch):
+    m = MultimodalAISystem()
+    assert m.extract_city_from_query("What's the weather in New York?") == "New York"
+EOF
+
+          mkdir -p .github/workflows
+          cat > .github/workflows/ci.yml <<'EOF'
+name: CI
+on:
+  push:
+    branches: [ main, "**" ]
+  pull_request:
+    branches: [ main ]
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+      - name: Install deps
+        run: pip install -r aegis_multimodal_ai_system/requirements.txt
+      - name: Run tests
+        run: pytest -q
+EOF
+
+          cat > Dockerfile <<'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY aegis_multimodal_ai_system/requirements.txt ./aegis_multimodal_ai_system/requirements.txt
+RUN pip install --no-cache-dir -r aegis_multimodal_ai_system/requirements.txt
+COPY . /app
+EXPOSE 8000
+CMD ["uvicorn", "aegis_multimodal_ai_system.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EOF
+
+          cat > aegis_multimodal_ai_system/app.py <<'EOF'
+import os, time, logging
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from aegis_multimodal_ai_system.middleware.auth_rate_limit import APIKeyAuthMiddleware, RateLimitMiddleware
+
+API_KEY = os.getenv("AEGIS_API_KEY", "changeme")
+MAX_CONTENT_LENGTH = int(os.getenv("AEGIS_MAX_CONTENT_LENGTH", 5 * 1024 * 1024))
+app = FastAPI(title="Aegis Multimodal AI System")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("aegis")
+start_time = time.time()
+
+class ContentLengthLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_CONTENT_LENGTH:
+                    return JSONResponse({"error": "Payload too large"}, status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+            except ValueError:
+                pass
+        return await call_next(request)
+
+app.add_middleware(ContentLengthLimitMiddleware)
+app.add_middleware(APIKeyAuthMiddleware)
+app.add_middleware(RateLimitMiddleware)
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "uptime_seconds": int(time.time() - start_time)}
+
+@app.get("/protected")
+async def protected(request: Request):
+    key = request.headers.get("x-api-key")
+    if API_KEY and key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return {"message": "authorized"}
+EOF
+
+          git add .
+          git commit -m "chore: quick-wins — CI, Dockerfile, health, middleware, tests, pinned deps" || true
+          git push origin "$BRANCH" || true
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: enhancement/quick-wins
+          base: main
+          title: "chore: quick-wins — CI, Dockerfile, health endpoint, logging, auth & tests"
+          body: |
+            This PR applies a set of quick wins to make the repository easier to run and review: adds health endpoint, middleware, CI, Dockerfile, pinned requirements, and unit tests.
+          labels: quick-win, automation
