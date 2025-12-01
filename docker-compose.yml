@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  federated-server:
+    build: .
+    container_name: aegis_federated_server
+    command: python -m aegis_multimodal_ai_system.federated.server
+    ports:
+      - "8080:8080"   # Flower server
+      - "8000:8000"   # Prometheus metrics (prometheus_client)
+    restart: "no"
+
+  federated-client-1:
+    build: .
+    container_name: aegis_federated_client_1
+    command: python -m aegis_multimodal_ai_system.federated.client --cid 1 --host federated-server:8080
+    depends_on:
+      - federated-server
+    restart: "no"
+
+  federated-client-2:
+    build: .
+    container_name: aegis_federated_client_2
+    command: python -m aegis_multimodal_ai_system.federated.client --cid 2 --host federated-server:8080
+    depends_on:
+      - federated-server
+    restart: "no"
