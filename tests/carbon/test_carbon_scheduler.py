@@ -5,7 +5,12 @@ Unit tests for carbon scheduler: local override and TTL cache behavior.
 import os
 import time
 
-from aegis_multimodal_ai_system.carbon.carbon_scheduler import get_current_intensity, should_schedule_now, _CACHE, _CACHE_LOCK
+from aegis_multimodal_ai_system.carbon.carbon_scheduler import (
+    get_current_intensity,
+    should_schedule_now,
+    _CACHE,
+    _CACHE_LOCK,
+)
 
 
 def test_local_override():
