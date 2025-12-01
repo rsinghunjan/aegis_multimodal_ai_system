@@ -16,6 +16,13 @@
 # - Docker and Docker Compose installed
 # - TLS certificates (or use Let's Encrypt with Traefik)
 # - Environment variables configured (see .env.example)
+# - Create Dockerfiles (see NOTE below)
+#
+# NOTE: Dockerfiles need to be created before building:
+#   - docker/Dockerfile.api - For the AEGIS API service
+#   - docker/Dockerfile.flower - For the Flower federated learning server
+#   See existing Dockerfiles in the repository (e.g., aegis_mmaisys_dockerfile-prodready.rtf)
+#   for reference, or use pre-built images from your container registry.
 #
 # For production:
 # - Enable TLS/HTTPS

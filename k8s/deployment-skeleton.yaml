@@ -54,7 +54,32 @@ data:
 # ==========================================================================
 # Secret - Sensitive Configuration
 # ==========================================================================
-# NOTE: In production, use external secret management (Vault, AWS Secrets Manager, etc.)
+# IMPORTANT: In production, use external secret management (Vault, AWS Secrets Manager, etc.)
+# DO NOT store actual secrets in version control!
+# 
+# Option 1: Use Kubernetes Secrets from kubectl
+#   kubectl create secret generic aegis-secrets \
+#     --from-literal=OIDC_CLIENT_SECRET='your-secret' \
+#     --from-literal=API_SECRET_KEY='your-key'
+#
+# Option 2: Use External Secrets Operator with Vault/AWS
+#   https://external-secrets.io/
+#
+# Option 3: Use Sealed Secrets for GitOps
+#   https://github.com/bitnami-labs/sealed-secrets
+#
+# The following is a TEMPLATE ONLY - create secrets using one of the above methods
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: aegis-secrets
+#   namespace: aegis
+# type: Opaque
+# stringData:
+#   OIDC_CLIENT_SECRET: "REPLACE_VIA_SECURE_METHOD"
+#   API_SECRET_KEY: "REPLACE_VIA_SECURE_METHOD"
+---
+# Placeholder Secret reference (create using kubectl or external secrets)
 apiVersion: v1
 kind: Secret
 metadata:
@@ -62,11 +87,10 @@ metadata:
   namespace: aegis
   labels:
     app.kubernetes.io/name: aegis
+  annotations:
+    kubernetes.io/description: "Create this secret using kubectl or external secrets operator - DO NOT store values in git"
 type: Opaque
-stringData:
-  # Replace with actual secrets in production
-  OIDC_CLIENT_SECRET: "placeholder-replace-in-production"
-  API_SECRET_KEY: "placeholder-replace-in-production"
+data: {}
 
 ---
 # ==========================================================================
@@ -102,8 +126,10 @@ spec:
         fsGroup: 1000
       containers:
         - name: api
-          image: aegis-api:latest  # Replace with your registry
-          imagePullPolicy: Always
+          # Replace with your container registry and specific version tag
+          # Example: ghcr.io/your-org/aegis-api:v1.0.0
+          image: aegis-api:v1.0.0
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8000
@@ -204,8 +230,10 @@ spec:
         runAsUser: 1000
       containers:
         - name: flower
-          image: aegis-flower:latest  # Replace with your registry
-          imagePullPolicy: Always
+          # Replace with your container registry and specific version tag
+          # Example: ghcr.io/your-org/aegis-flower:v1.0.0
+          image: aegis-flower:v1.0.0
+          imagePullPolicy: IfNotPresent
           ports:
             - name: grpc
               containerPort: 8080
