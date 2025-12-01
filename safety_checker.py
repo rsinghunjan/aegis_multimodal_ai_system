@@ -1,8 +1,3 @@
-  
- 
- 
- 
-
 import logging
 import re
 from typing import Callable, Iterable, List, Optional
@@ -86,5 +81,13 @@ class SafetyChecker:
                 return True
 
         logger.debug("Text considered safe by heuristics")
-        return False
-aegis_multimodal_ai_system/safety_checker.py
+        return False  
+ 
+ 
+ 
+
+
+
+      
+
+        
