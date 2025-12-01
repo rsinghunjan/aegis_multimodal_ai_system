@@ -1,0 +1,4 @@
+[tool.ruff]
+line-length = 88
+exclude = ["docs", "build", ".venv", "venv", "dist"]
+extend-ignore = ["E203", "W503"]
