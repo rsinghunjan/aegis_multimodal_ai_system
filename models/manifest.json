@@ -1,0 +1,10 @@
+{
+  "models": [
+    {
+      "id": "safety-v0",
+      "type": "heuristic",
+      "notes": "Built-in heuristic safety checker. Replace with real model endpoint or local model.",
+      "version": "0.1.0"
+    }
+  ]
+}
