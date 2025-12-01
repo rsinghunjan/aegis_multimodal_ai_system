@@ -1,0 +1,39 @@
+name: Federated smoke test
+
+on:
+  push:
+    branches: [ main, add-tests-ci-safety ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  federated-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r aegis_multimodal_ai_system/requirements.txt
+
+      - name: Make scripts executable
+        run: |
+          chmod +x scripts/run_federated_smoke.sh
+          chmod +x scripts/start-federated-server.sh
+          chmod +x scripts/start-federated-client.sh
+
+      - name: Run federated smoke test
+        env:
+          # Ensure logs directory exists for audit logging
+          LOGS_DIR: logs
+        run: |
+          mkdir -p "${LOGS_DIR}"
+          ./scripts/run_federated_smoke.sh
