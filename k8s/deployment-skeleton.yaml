@@ -1,0 +1,523 @@
+# AEGIS Multimodal AI System - Kubernetes Deployment Skeleton
+#
+# This file contains skeleton manifests for deploying AEGIS to Kubernetes.
+# Customize these manifests for your specific environment.
+#
+# Prerequisites:
+# - Kubernetes cluster (1.24+)
+# - kubectl configured
+# - Container registry with AEGIS images
+#
+# Deployment:
+#   kubectl apply -f deployment-skeleton.yaml
+#
+# For production, consider:
+# - Use Kustomize or Helm for environment-specific configs
+# - Configure proper RBAC
+# - Enable Pod Security Standards
+# - Set up Ingress with TLS
+# - Configure HPA for autoscaling
+# - Add PodDisruptionBudgets
+
+---
+# ==========================================================================
+# Namespace
+# ==========================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aegis
+  labels:
+    app.kubernetes.io/name: aegis
+    app.kubernetes.io/part-of: aegis-system
+
+---
+# ==========================================================================
+# ConfigMap - Application Configuration
+# ==========================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aegis-config
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis
+data:
+  LOG_LEVEL: "INFO"
+  REDIS_URL: "redis://aegis-redis:6379/0"
+  CARBON_API_URL: "https://api.carbonintensity.org.uk/intensity"
+  CARBON_INTENSITY_THRESHOLD: "200"
+  FLOWER_NUM_ROUNDS: "10"
+  FLOWER_MIN_CLIENTS: "2"
+
+---
+# ==========================================================================
+# Secret - Sensitive Configuration
+# ==========================================================================
+# NOTE: In production, use external secret management (Vault, AWS Secrets Manager, etc.)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aegis-secrets
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis
+type: Opaque
+stringData:
+  # Replace with actual secrets in production
+  OIDC_CLIENT_SECRET: "placeholder-replace-in-production"
+  API_SECRET_KEY: "placeholder-replace-in-production"
+
+---
+# ==========================================================================
+# AEGIS API Deployment
+# ==========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-api
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-api
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aegis-api
+        app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: aegis-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: api
+          image: aegis-api:latest  # Replace with your registry
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: aegis-config
+            - secretRef:
+                name: aegis-secrets
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: models
+              mountPath: /app/models
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: models
+          persistentVolumeClaim:
+            claimName: aegis-models-pvc
+
+---
+# ==========================================================================
+# AEGIS API Service
+# ==========================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-api
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-api
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: aegis-api
+
+---
+# ==========================================================================
+# Flower Server Deployment
+# ==========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-flower
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-flower
+    app.kubernetes.io/component: federated-learning
+spec:
+  replicas: 1  # Flower server is typically single instance
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-flower
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aegis-flower
+        app.kubernetes.io/component: federated-learning
+    spec:
+      serviceAccountName: aegis-flower
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: flower
+          image: aegis-flower:latest  # Replace with your registry
+          imagePullPolicy: Always
+          ports:
+            - name: grpc
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: aegis-config
+          env:
+            - name: FLOWER_SERVER_ADDRESS
+              value: "0.0.0.0:8080"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: aegis-models-pvc
+
+---
+# ==========================================================================
+# Flower Server Service
+# ==========================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-flower
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-flower
+spec:
+  type: LoadBalancer  # Expose for external FL clients
+  ports:
+    - name: grpc
+      port: 8080
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: aegis-flower
+
+---
+# ==========================================================================
+# Redis Deployment
+# ==========================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-redis
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-redis
+    app.kubernetes.io/component: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aegis-redis
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --maxmemory
+            - "256mb"
+            - --maxmemory-policy
+            - allkeys-lru
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: redis-data-pvc
+
+---
+# ==========================================================================
+# Redis Service
+# ==========================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-redis
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-redis
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+  selector:
+    app.kubernetes.io/name: aegis-redis
+
+---
+# ==========================================================================
+# Service Accounts
+# ==========================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aegis-api
+  namespace: aegis
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aegis-flower
+  namespace: aegis
+
+---
+# ==========================================================================
+# Persistent Volume Claims
+# ==========================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aegis-models-pvc
+  namespace: aegis
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  # Uncomment and set storageClassName for your cluster
+  # storageClassName: standard
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data-pvc
+  namespace: aegis
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: standard
+
+---
+# ==========================================================================
+# Horizontal Pod Autoscaler (HPA) - API
+# ==========================================================================
+# Uncomment to enable autoscaling
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: aegis-api-hpa
+#   namespace: aegis
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: aegis-api
+#   minReplicas: 2
+#   maxReplicas: 10
+#   metrics:
+#     - type: Resource
+#       resource:
+#         name: cpu
+#         target:
+#           type: Utilization
+#           averageUtilization: 70
+#     - type: Resource
+#       resource:
+#         name: memory
+#         target:
+#           type: Utilization
+#           averageUtilization: 80
+
+---
+# ==========================================================================
+# Ingress (with TLS)
+# ==========================================================================
+# Uncomment and configure for your ingress controller
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: aegis-ingress
+#   namespace: aegis
+#   annotations:
+#     kubernetes.io/ingress.class: nginx
+#     nginx.ingress.kubernetes.io/ssl-redirect: "true"
+#     cert-manager.io/cluster-issuer: letsencrypt-prod
+# spec:
+#   tls:
+#     - hosts:
+#         - api.aegis.example.com
+#       secretName: aegis-tls
+#   rules:
+#     - host: api.aegis.example.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: aegis-api
+#                 port:
+#                   number: 8000
+
+---
+# ==========================================================================
+# Network Policy
+# ==========================================================================
+# Uncomment to enable network segmentation
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: aegis-api-network-policy
+#   namespace: aegis
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: aegis-api
+#   policyTypes:
+#     - Ingress
+#     - Egress
+#   ingress:
+#     - from:
+#         - namespaceSelector:
+#             matchLabels:
+#               name: ingress-nginx
+#       ports:
+#         - protocol: TCP
+#           port: 8000
+#   egress:
+#     - to:
+#         - podSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: aegis-redis
+#       ports:
+#         - protocol: TCP
+#           port: 6379
+#     - to:  # Allow external API calls (carbon API, etc.)
+#         - ipBlock:
+#             cidr: 0.0.0.0/0
+#             except:
+#               - 10.0.0.0/8
+#               - 172.16.0.0/12
+#               - 192.168.0.0/16
+#       ports:
+#         - protocol: TCP
+#           port: 443
+
+---
+# ==========================================================================
+# Pod Disruption Budget
+# ==========================================================================
+# apiVersion: policy/v1
+# kind: PodDisruptionBudget
+# metadata:
+#   name: aegis-api-pdb
+#   namespace: aegis
+# spec:
+#   minAvailable: 1
+#   selector:
+#     matchLabels:
+#       app.kubernetes.io/name: aegis-api

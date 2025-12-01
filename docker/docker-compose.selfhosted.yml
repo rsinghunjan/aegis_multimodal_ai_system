@@ -1,0 +1,211 @@
+# AEGIS Self-Hosted Docker Compose Configuration
+#
+# This file provides a complete self-hosted deployment of the AEGIS
+# Multimodal AI System with all core services.
+#
+# Services:
+# - aegis-api: Main API service (FastAPI)
+# - flower-server: Federated learning server
+# - redis: Cache and message broker
+# - traefik: Reverse proxy with TLS
+#
+# Usage:
+#   docker-compose -f docker-compose.selfhosted.yml up -d
+#
+# Prerequisites:
+# - Docker and Docker Compose installed
+# - TLS certificates (or use Let's Encrypt with Traefik)
+# - Environment variables configured (see .env.example)
+#
+# For production:
+# - Enable TLS/HTTPS
+# - Configure proper authentication
+# - Set resource limits
+# - Enable health checks
+# - Configure logging and monitoring
+
+version: "3.8"
+
+services:
+  # ==========================================================================
+  # Traefik Reverse Proxy
+  # ==========================================================================
+  traefik:
+    image: traefik:v2.10
+    container_name: aegis-traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./certs:/certs:ro
+      - traefik-acme:/acme
+    environment:
+      - TZ=UTC
+    networks:
+      - aegis-network
+    labels:
+      - "traefik.enable=true"
+      # Dashboard (optional, disable in production or secure properly)
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.middlewares=auth"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==========================================================================
+  # AEGIS API Service
+  # ==========================================================================
+  aegis-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    image: aegis-api:latest
+    container_name: aegis-api
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CARBON_API_URL=${CARBON_API_URL:-}
+      - CARBON_INTENSITY_THRESHOLD=${CARBON_THRESHOLD:-200}
+      - OIDC_ISSUER=${OIDC_ISSUER:-}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:-}
+    volumes:
+      - aegis-models:/app/models
+      - aegis-data:/app/data
+    networks:
+      - aegis-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.aegis-api.rule=Host(`api.${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.aegis-api.entrypoints=websecure"
+      - "traefik.http.routers.aegis-api.tls=true"
+      - "traefik.http.services.aegis-api.loadbalancer.server.port=8000"
+      - "traefik.http.routers.aegis-api.middlewares=rate-limit,security-headers"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ==========================================================================
+  # Flower Federated Learning Server
+  # ==========================================================================
+  flower-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.flower
+    image: aegis-flower:latest
+    container_name: aegis-flower
+    restart: unless-stopped
+    environment:
+      - FLOWER_SERVER_ADDRESS=0.0.0.0:8080
+      - FLOWER_NUM_ROUNDS=${FLOWER_NUM_ROUNDS:-10}
+      - FLOWER_MIN_CLIENTS=${FLOWER_MIN_CLIENTS:-2}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "8080:8080"  # Expose for federated clients
+    volumes:
+      - aegis-models:/app/models
+    networks:
+      - aegis-network
+    labels:
+      - "traefik.enable=false"  # Direct port access for FL clients
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==========================================================================
+  # Redis Cache and Message Broker
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: aegis-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - aegis-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ==========================================================================
+# Networks
+# ==========================================================================
+networks:
+  aegis-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ==========================================================================
+# Volumes
+# ==========================================================================
+volumes:
+  traefik-acme:
+    driver: local
+  aegis-models:
+    driver: local
+  aegis-data:
+    driver: local
+  redis-data:
+    driver: local
+
+# ==========================================================================
+# Configuration Notes
+# ==========================================================================
+# 
+# Environment Variables (.env file):
+# ----------------------------------
+# DOMAIN=aegis.example.com
+# LOG_LEVEL=INFO
+# CARBON_API_URL=https://api.carbonintensity.org.uk/intensity
+# CARBON_THRESHOLD=200
+# OIDC_ISSUER=https://auth.example.com
+# OIDC_CLIENT_ID=aegis-client
+# OIDC_CLIENT_SECRET=your-secret-here
+# FLOWER_NUM_ROUNDS=10
+# FLOWER_MIN_CLIENTS=2
+#
+# TLS Certificates:
+# -----------------
+# Place certificates in ./certs directory:
+# - server.crt
+# - server.key
+# - ca.crt (for mTLS)
+#
+# Or configure Let's Encrypt in traefik.yml
+#
+# Traefik Configuration:
+# ----------------------
+# Create ./traefik/traefik.yml with your settings
+# See aegis_multimodal_ai_system/security/zero_trust.md for examples
+#
+# Scaling:
+# --------
+# docker-compose -f docker-compose.selfhosted.yml up -d --scale aegis-api=3
+#
+# Monitoring:
+# -----------
+# Add Prometheus/Grafana services for production monitoring
+# Configure alerting for health check failures
