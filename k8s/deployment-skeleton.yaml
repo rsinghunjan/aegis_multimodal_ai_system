@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aegis-api
+  template:
+    metadata:
+      labels:
+        app: aegis-api
+      annotations:
+        # Example: cert-manager annotation for TLS secret
+        # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+        ingress.kubernetes.io/force-ssl-redirect: "true"
+    spec:
+      containers:
+        - name: aegis-api
+          image: aegis/api:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ENV
+              value: "production"
+          # Liveness/readiness probes should be added for production
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-api
+spec:
+  selector:
+    app: aegis-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+
+# Notes:
+# - Use a ServiceMesh (Linkerd/Istio) for mTLS between services.
+# - Use Ingress with TLS and OIDC forward-auth for user APIs.
+# - Add HPA and PodDisruptionBudgets for production readiness.
