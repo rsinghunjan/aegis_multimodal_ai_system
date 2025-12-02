@@ -1,0 +1,69 @@
+name: Security checks
+
+on:
+  push:
+    branches: [ main, add-tests-ci-safety ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        python-version: [3.11]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install minimal tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit==2.1.1 bandit==1.8.1 flake8==6.1.0 detect-secrets==1.4.0
+
+      - name: Install project deps (for static checks)
+        run: |
+          if [ -f aegis_multimodal_ai_system/requirements.txt ]; then pip install -r aegis_multimodal_ai_system/requirements.txt || true; fi
+
+      - name: Run pip-audit (package vulnerability scanner)
+        id: pipaudit
+        run: |
+          # Fail on issues discovered
+          python -m pip_audit --progress-spinner=off --fail-on high || (echo "pip-audit found issues"; exit 1)
+
+      - name: Run bandit (code security static analyzer)
+        id: bandit
+        run: |
+          bandit -r aegis_multimodal_ai_system -lll -q
+
+      - name: Run flake8
+        run: |
+          flake8 --max-line-length=120 aegis_multimodal_ai_system || (echo "flake8 failed"; exit 1)
+
+      - name: Detect secrets (scan repository)
+        id: detectsecrets
+        run: |
+          # This uses detect-secrets to find potential secrets. On CI we fail if findings exist.
+          detect-secrets scan > .secrets.baseline
+          # If baseline is empty we exit with 0, else fail early
+          if [ -s .secrets.baseline ]; then
+            echo "Potential secrets found:"
+            cat .secrets.baseline
+            exit 1
+          fi
+
+      - name: Optional: verify signed image (if SIGNED_IMAGE env provided)
+        if: env.SIGNED_IMAGE != ''
+        run: |
+          echo "VERIFYING signed image $SIGNED_IMAGE"
+          # Install cosign
+          curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b /usr/local/bin
+          cosign verify --key ${COSIGN_PUBKEY:-} "${SIGNED_IMAGE}"
