@@ -1,0 +1,9 @@
+
+# dev/test dependencies for running the e2e suite locally
+pytest==7.4.0
+requests==2.31.0
+pytest-cov==4.1.0
+httpx==0.26.1
+# reuse runtime requirements as needed
+-r api/requirements-api.txt
+-r api/requirements-db.txt
