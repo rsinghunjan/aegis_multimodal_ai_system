@@ -1,0 +1,17 @@
+
+name: Repo secret lint (block COSIGN private key usage)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        run: python3 -m pip install --upgrade pip
+      - name: Run repo secret linter
+        run: |
+          python3 scripts/repo_secret_lint.py
