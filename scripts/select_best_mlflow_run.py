@@ -107,9 +107,17 @@ def select_best_run(experiment_name: str, metric: str, maximize: bool) -> dict:
 def main():
     args = parse_args()
 
-    if args.maximize == args.minimize:
+    # Validate that exactly one of maximize or minimize is specified
+    if args.maximize and args.minimize:
         print(
-            "Error: Must specify exactly one of --maximize or --minimize",
+            "Error: Cannot specify both --maximize and --minimize",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not args.maximize and not args.minimize:
+        print(
+            "Error: Must specify one of --maximize or --minimize",
             file=sys.stderr,
         )
         sys.exit(1)

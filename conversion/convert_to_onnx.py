@@ -64,12 +64,14 @@ def load_model(checkpoint_path: str, model_class: Optional[str] = None) -> nn.Mo
             # This is a placeholder - in practice you'd have a model registry
             raise NotImplementedError(
                 "Model class loading not implemented. "
-                "Please save full model with torch.save(model, path)"
+                "To convert, save the full model with: torch.save(model, 'model.pt') "
+                "instead of just the state_dict."
             )
 
         raise ValueError(
             "Checkpoint contains only state_dict. "
-            "Please provide --model-class or save full model."
+            "Either provide --model-class or save full model with: "
+            "torch.save(model, 'model.pt')"
         )
 
     raise ValueError(f"Unknown checkpoint format: {type(checkpoint)}")
@@ -151,8 +153,8 @@ def convert_to_onnx(
         onnx.checker.check_model(onnx_model)
         model_size = Path(output_path).stat().st_size
     except ImportError:
-        print("Warning: onnx package not installed, skipping verification",
-              file=sys.stderr)
+        print("Warning: onnx package not installed, skipping verification. "
+              "Install with: pip install onnx", file=sys.stderr)
         model_size = Path(output_path).stat().st_size
 
     metadata = {

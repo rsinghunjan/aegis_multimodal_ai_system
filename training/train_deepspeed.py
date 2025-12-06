@@ -41,7 +41,12 @@ def main():
     with mlflow.start_run() as run:
         mlflow.log_param("script", "train_deepspeed.py")
         model = build_model()
-        # Dummy training loop (replace with DeepSpeed training harness)
+        # TODO: Replace this dummy training loop with DeepSpeed training harness:
+        # 1. Initialize DeepSpeed: model_engine, optimizer, _, _ = deepspeed.initialize(
+        #        model=model, config=ds_config, model_parameters=model.parameters())
+        # 2. Use model_engine.train() and model_engine.step() for training
+        # 3. Save with model_engine.save_checkpoint()
+        # See: https://www.deepspeed.ai/getting-started/
         for epoch in range(args.max_epochs):
             mlflow.log_metric("train/dummy_loss", 1.0 / (epoch + 1), step=epoch)
         ckpt_path = out_dir / "pytorch_model.bin"

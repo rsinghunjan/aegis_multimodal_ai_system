@@ -248,8 +248,8 @@ def main():
     )
     parser.add_argument(
         "--vault-addr",
-        default=os.environ.get("VAULT_ADDR", "VAULT_ADDR"),
-        help="Vault server address (default: VAULT_ADDR env or placeholder)",
+        default=os.environ.get("VAULT_ADDR"),
+        help="Vault server address (required, or set VAULT_ADDR env var)",
     )
     parser.add_argument(
         "--vault-key",
@@ -262,6 +262,12 @@ def main():
         help="Job name for artifact naming (optional)",
     )
     args = parser.parse_args()
+
+    # Validate vault_addr is provided
+    if not args.vault_addr:
+        print("Error: --vault-addr is required or set VAULT_ADDR environment variable",
+              file=sys.stderr)
+        sys.exit(1)
 
     try:
         result = capture_and_sign(
