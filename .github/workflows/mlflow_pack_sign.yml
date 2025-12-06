@@ -39,6 +39,8 @@ env:
 jobs:
   select-best-run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       run-id: ${{ steps.select.outputs.run_id }}
       artifact-uri: ${{ steps.select.outputs.artifact_uri }}
@@ -172,6 +174,9 @@ jobs:
   verify-signature:
     needs: [select-best-run, package-and-sign]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
