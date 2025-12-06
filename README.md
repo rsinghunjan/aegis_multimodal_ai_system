@@ -1,6 +1,6 @@
 # Aegis Secure Multimodal AI Model Delivery System
 
-# Aegis Overview
+# Overview
 * Aegis is an opinionated MLOps product that secures the entire model supply chain for multimodal AI: build → deterministic package → sign → verify → deploy → monitor → govern. It prevents unauthorized or tampered model artifacts from running in production by combining deterministic archives, cryptographic signing (Sigstore/cosign), CI verifiers (OIDC), fail‑closed runtime enforcement, and audited promotions — packaged with multi‑cloud deploy automation, canary rollouts, monitoring, and a lightweight governance UI.
 
 # "Does It Do AI?"
