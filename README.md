@@ -1,9 +1,9 @@
 # Aegis Platform
-* Aegis is a multi‑cloud, multi‑hardware ML/AI platform for end‑to‑end model lifecycle: data → RAG → training (DeepSpeed, TPU/TPU‑like support) → RLHF → serving (vLLM / Triton) → observability & governance. It runs on AWS / Azure / GCP / OCI / Alibaba, supports GPU / CPU / TPU, does large‑scale distributed training and high‑throughput inference, and includes both generative AI pipelines and agentic automation (policy‑governed actions, automated approvals, compensation/rollback). The platform provides CI/CD workflows, security (Vault/KMS, short‑lived tokens, JWKS/mTLS examples), policy enforcement (OPA/rego), auditor tooling (decision_log → Metabase, Auditor UI), and robust chaos/rollback tests for operational safety.
+* Aegis is a multi‑cloud, multi‑hardware ML/AI platform for end‑to‑end model lifecycle: data → RAG → training (DeepSpeed, TPU/TPU‑like support) → RLHF → serving (vLLM / Triton) → observability & governance. It runs on AWS / Azure / GCP / OCI / Alibaba / NVIDIA DGX Cloud, supports GPU / CPU / TPU, does large‑scale distributed training and high‑throughput inference, and includes both generative AI pipelines and agentic automation (policy‑governed actions, automated approvals, compensation/rollback). The platform provides CI/CD workflows, security (Vault/KMS, short‑lived tokens, JWKS/mTLS examples), policy enforcement (OPA/rego), auditor tooling (decision_log → Metabase, Auditor UI), and robust chaos/rollback tests for operational safety.
 
 # Key Features
 
-   *  Multi‑cloud deploys: AWS / Azure / GCP / OCI / Alibaba.
+   *  Multi‑cloud deploys: AWS / Azure / GCP / OCI / Alibaba / NVIDIA DGX Cloud
    * Hardware support: GPU, CPU, TPU.
    * Large‑scale training: DeepSpeed + sharding, TPU support.
    * Serving: vLLM, Triton, batching/quantization support.
